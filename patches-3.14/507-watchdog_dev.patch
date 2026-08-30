@@ -1,0 +1,45 @@
+diff -Naur a/drivers/watchdog/watchdog_dev.c b/drivers/watchdog/watchdog_dev.c
+--- a/drivers/watchdog/watchdog_dev.c	2016-04-19 23:41:04.000000000 -0700
++++ b/drivers/watchdog/watchdog_dev.c	2016-05-18 12:15:05.995478444 -0700
+@@ -418,11 +418,6 @@
+ 		wdd = old_wdd;
+ 	else
+ 		wdd = container_of(inode->i_cdev, struct watchdog_device, cdev);
+-
+-	/* the watchdog is single open! */
+-	if (test_and_set_bit(WDOG_DEV_OPEN, &wdd->status))
+-		return -EBUSY;
+-
+ 	/*
+ 	 * If the /dev/watchdog device is open, we don't want the module
+ 	 * to be unloaded.
+@@ -445,7 +440,6 @@
+ out_mod:
+ 	module_put(wdd->ops->owner);
+ out:
+-	clear_bit(WDOG_DEV_OPEN, &wdd->status);
+ 	return err;
+ }
+ 
+@@ -476,20 +470,12 @@
+ 		err = watchdog_stop(wdd);
+ 
+ 	/* If the watchdog was not stopped, send a keepalive ping */
+-	if (err < 0) {
+-		mutex_lock(&wdd->lock);
+-		if (!test_bit(WDOG_UNREGISTERED, &wdd->status))
+-			dev_crit(wdd->dev, "watchdog did not stop!\n");
+-		mutex_unlock(&wdd->lock);
++	if (err < 0)
+ 		watchdog_ping(wdd);
+-	}
+ 
+ 	/* Allow the owner module to be unloaded again */
+ 	module_put(wdd->ops->owner);
+ 
+-	/* make sure that /dev/watchdog can be re-opened */
+-	clear_bit(WDOG_DEV_OPEN, &wdd->status);
+-
+ 	/* Note wdd may be gone after this, do not use after this! */
+ 	if (wdd->ops->unref)
+ 		wdd->ops->unref(wdd);

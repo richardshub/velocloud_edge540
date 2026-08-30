@@ -1,0 +1,97 @@
+diff -Naur a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c	2016-12-16 13:19:51.568976562 -0800
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c	2016-12-16 13:28:52.360369631 -0800
+@@ -5495,6 +5495,7 @@
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_IXGBE_VC_PM
+ #ifdef CONFIG_PM
+ static int ixgbe_resume(struct pci_dev *pdev)
+ {
+@@ -5538,6 +5539,7 @@
+ 	return 0;
+ }
+ #endif /* CONFIG_PM */
++#endif /* CONFIG_IXGBE_VC_PM */
+ 
+ static int __ixgbe_shutdown(struct pci_dev *pdev, bool *enable_wake)
+ {
+@@ -5546,9 +5548,11 @@
+ 	struct ixgbe_hw *hw = &adapter->hw;
+ 	u32 ctrl, fctrl;
+ 	u32 wufc = adapter->wol;
++#ifdef CONFIG_IXGBE_VC_PM
+ #ifdef CONFIG_PM
+ 	int retval = 0;
+ #endif
++#endif
+ 
+ 	netif_device_detach(netdev);
+ 
+@@ -5563,12 +5567,14 @@
+ 
+ 	ixgbe_clear_interrupt_scheme(adapter);
+ 
++#ifdef CONFIG_IXGBE_VC_PM
+ #ifdef CONFIG_PM
+ 	retval = pci_save_state(pdev);
+ 	if (retval)
+ 		return retval;
+ 
+ #endif
++#endif
+ 	if (hw->mac.ops.stop_link_on_d3)
+ 		hw->mac.ops.stop_link_on_d3(hw);
+ 
+@@ -5618,6 +5624,7 @@
+ }
+ 
+ #ifdef CONFIG_PM
++#ifdef CONFIG_IXGBE_VC_PM
+ static int ixgbe_suspend(struct pci_dev *pdev, pm_message_t state)
+ {
+ 	int retval;
+@@ -5637,6 +5644,7 @@
+ 	return 0;
+ }
+ #endif /* CONFIG_PM */
++#endif /* CONFIG_IXGBE_VC_PM */
+ 
+ static void ixgbe_shutdown(struct pci_dev *pdev)
+ {
+@@ -8504,10 +8512,12 @@
+ 	.id_table = ixgbe_pci_tbl,
+ 	.probe    = ixgbe_probe,
+ 	.remove   = ixgbe_remove,
++#ifdef CONFIG_IXGBE_VC_PM
+ #ifdef CONFIG_PM
+ 	.suspend  = ixgbe_suspend,
+ 	.resume   = ixgbe_resume,
+ #endif
++#endif
+ 	.shutdown = ixgbe_shutdown,
+ 	.sriov_configure = ixgbe_pci_sriov_configure,
+ 	.err_handler = &ixgbe_err_handler
+diff -Naur a/drivers/net/ethernet/intel/Kconfig b/drivers/net/ethernet/intel/Kconfig
+--- a/drivers/net/ethernet/intel/Kconfig	2016-12-16 13:19:51.564976745 -0800
++++ b/drivers/net/ethernet/intel/Kconfig	2016-12-16 13:24:04.261480665 -0800
+@@ -211,6 +211,18 @@
+ 	  Say Y if you want to expose the thermal sensor data on some of
+ 	  our cards, via a hwmon sysfs interface.
+ 
++config IXGBE_VC_PM
++	bool "VeloCloud PM (pwr mgt) support for IXGBE driver"
++	default n
++	depends on IXGBE && (PM_SLEEP || PM_RUNTIME)
++	---help---
++	Say Y here if we want to enable power management support for the
++	IXGBE driver.  Note that this will call suspend/resume.  This is 
++	important because suspend will disable the device/function.  Resume
++	will reinitialize the device.  If you don't know if this feature
++	should be enabled, keep the default setting.
++
++
+ config IXGBE_DCA
+ 	bool "Direct Cache Access (DCA) Support"
+ 	default y

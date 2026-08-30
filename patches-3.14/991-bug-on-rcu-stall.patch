@@ -1,0 +1,55 @@
+Panic on RCU stalls if a new parameter is set
+
+sysctl kernel.rcutree_bug_on_stall, or kernel parm rcutree.rcutree_bug_on_stall.
+
+--- a/include/linux/rcupdate.h	2016-04-19 23:41:04.000000000 -0700
++++ b/include/linux/rcupdate.h	2017-03-14 13:09:31.382100789 -0700
+@@ -45,6 +45,9 @@
+ #include <linux/bug.h>
+ #include <linux/compiler.h>
+ 
++#ifdef CONFIG_TREE_RCU
++extern int rcutree_bug_on_stall; /* for sysctl */
++#endif /* #ifdef CONFIG_TREE_RCU */
+ #ifdef CONFIG_RCU_TORTURE_TEST
+ extern int rcutorture_runnable; /* for sysctl */
+ #endif /* #ifdef CONFIG_RCU_TORTURE_TEST */
+--- a/kernel/sysctl.c	2016-04-19 23:41:04.000000000 -0700
++++ b/kernel/sysctl.c	2017-03-14 13:07:45.614922840 -0700
+@@ -1042,6 +1042,15 @@
+ 		.child		= key_sysctls,
+ 	},
+ #endif
++#ifdef CONFIG_TREE_RCU
++	{
++		.procname       = "rcutree_bug_on_stall",
++		.data           = &rcutree_bug_on_stall,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler	= proc_dointvec,
++	},
++#endif
+ #ifdef CONFIG_RCU_TORTURE_TEST
+ 	{
+ 		.procname       = "rcutorture_runnable",
+--- a/kernel/rcu/tree.c	2016-04-19 23:41:04.000000000 -0700
++++ b/kernel/rcu/tree.c	2017-03-14 14:13:20.223144392 -0700
+@@ -119,6 +119,9 @@
+ };
+ int rcu_num_nodes __read_mostly = NUM_RCU_NODES; /* Total # rcu_nodes in use. */
+ 
++int rcutree_bug_on_stall;
++module_param(rcutree_bug_on_stall, int, 0444);
++
+ /*
+  * The rcu_scheduler_active variable transitions from zero to one just
+  * before the first task is spawned.  So when this variable is zero, RCU
+@@ -978,6 +981,8 @@
+ 	if (!trigger_all_cpu_backtrace())
+ 		dump_stack();
+ 
++	BUG_ON(rcutree_bug_on_stall);
++
+ 	raw_spin_lock_irqsave(&rnp->lock, flags);
+ 	if (ULONG_CMP_GE(jiffies, rsp->jiffies_stall))
+ 		rsp->jiffies_stall = jiffies +

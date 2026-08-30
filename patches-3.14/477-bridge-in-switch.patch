@@ -1,0 +1,35 @@
+--- a/drivers/net/dsa/mv88e6123_61_65.c
++++ b/drivers/net/dsa/mv88e6123_61_65.c
+@@ -205,10 +205,7 @@
+ 	 * ports, but force the CPU port and all DSA ports to 1000 Mb/s
+ 	 * full duplex.
+ 	 */
+-	if (dsa_is_cpu_port(ds, p) || ds->dsa_port_mask & (1 << p))
+-		REG_WRITE(addr, 0x01, 0x003e);
+-	else
+-		REG_WRITE(addr, 0x01, 0x0003);
++	REG_WRITE(addr, 0x01, 0x000f);
+ 
+ 	/*
+ 	 * Do not limit the period of time that this port can be
+@@ -254,14 +251,14 @@
+ 	/*
+ 	 * Port based VLAN map: give each port its own address
+ 	 * database, allow the CPU port to talk to each of the 'real'
+-	 * ports, and allow each of the 'real' ports to only talk to
+-	 * the upstream port.
++	 * ports, and allow each of the 'real' ports to talk to each
++	 * other and the upstream port.
+ 	 */
+-	val = (p & 0xf) << 12;
+-	if (dsa_is_cpu_port(ds, p))
+-		val |= ds->phys_port_mask;
+-	else
++	val = ds->phys_port_mask;
++	if ( !dsa_is_cpu_port(ds, p)) {
+ 		val |= 1 << dsa_upstream_port(ds);
++		val &= ~(1 << p);
++	}
+ 	REG_WRITE(addr, 0x06, val);
+ 
+ 	/*

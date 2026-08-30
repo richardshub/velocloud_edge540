@@ -1,0 +1,101 @@
+--- a/arch/x86/kernel/early_printk.c	2013-05-07 20:33:25.000000000 -0700
++++ b/arch/x86/kernel/early_printk.c	2013-05-30 00:42:11.175828352 -0700
+@@ -1,3 +1,4 @@
++#include <linux/delay.h>
+ #include <linux/console.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+@@ -23,6 +24,7 @@
+ 
+ static int max_ypos = 25, max_xpos = 80;
+ static int current_ypos = 25, current_xpos;
++static int vga_slow = 0;
+ 
+ static void early_vga_write(struct console *con, const char *str, unsigned n)
+ {
+@@ -41,6 +43,15 @@
+ 			for (i = 0; i < max_xpos; i++)
+ 				writew(0x720, VGABASE + 2*(max_xpos*j + i));
+ 			current_ypos = max_ypos-1;
++
++			// slow vga scrolling for readability;
++
++			if(vga_slow) {
++				for(i = 0; i < vga_slow * 1000; i++) {
++					volatile unsigned short v;
++					v = readw(VGABASE);
++				}
++			}
+ 		}
+ #ifdef CONFIG_KGDB_KDB
+ 		if (c == '\b') {
+@@ -65,6 +76,23 @@
+ 	}
+ }
+ 
++static __init void early_vga_init(char *s)
++{
++	unsigned char c;
++	unsigned slow;
++	char *e;
++
++	if (*s == ',')
++		++s;
++
++	if (*s) {
++		slow = simple_strtoul(s, &e, 10);
++		if (slow > 10000 || s == e)
++			slow = 0;
++		vga_slow = slow;
++	}
++}
++
+ static struct console early_vga_console = {
+ 	.name =		"earlyvga",
+ 	.write =	early_vga_write,
+@@ -114,7 +142,7 @@
+ 
+ #define DEFAULT_BAUD 9600
+ 
+-static __init void early_serial_init(char *s)
++static __init void early_serial_init(char *s, unsigned baud_clk)
+ {
+ 	unsigned char c;
+ 	unsigned divisor;
+@@ -154,7 +182,7 @@
+ 			baud = DEFAULT_BAUD;
+ 	}
+ 
+-	divisor = 115200 / baud;
++	divisor = baud_clk / baud;
+ 	c = inb(early_serial_base + LCR);
+ 	outb(c | DLAB, early_serial_base + LCR);
+ 	outb(divisor & 0xff, early_serial_base + DLL);
+@@ -216,13 +244,17 @@
+ 	while (*buf != '\0') {
+ 		if (!strncmp(buf, "serial", 6)) {
+ 			buf += 6;
+-			early_serial_init(buf);
++			early_serial_init(buf, 115200);
+ 			early_console_register(&early_serial_console, keep);
+ 			if (!strncmp(buf, ",ttyS", 5))
+ 				buf += 5;
+ 		}
+ 		if (!strncmp(buf, "ttyS", 4)) {
+-			early_serial_init(buf + 4);
++			early_serial_init(buf + 4, 115200);
++			early_console_register(&early_serial_console, keep);
++		}
++		if (!strncmp(buf, "pch", 3)) {
++			early_serial_init(buf + 3, 12000000);
+ 			early_console_register(&early_serial_console, keep);
+ 		}
+ 		if (!strncmp(buf, "vga", 3) &&
+@@ -230,6 +262,7 @@
+ 			max_xpos = boot_params.screen_info.orig_video_cols;
+ 			max_ypos = boot_params.screen_info.orig_video_lines;
+ 			current_ypos = boot_params.screen_info.orig_y;
++			early_vga_init(buf + 3);
+ 			early_console_register(&early_vga_console, keep);
+ 		}
+ #ifdef CONFIG_EARLY_PRINTK_DBGP

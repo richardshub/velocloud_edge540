@@ -1,0 +1,688 @@
+--- a/include/linux/mfd/lpc_ich.h
++++ b/include/linux/mfd/lpc_ich.h
+@@ -21,23 +21,26 @@
+ #define LPC_ICH_H
+ 
+ /* Watchdog resources */
+-#define ICH_RES_IO_TCO	0
+-#define ICH_RES_IO_SMI	1
+-#define ICH_RES_MEM_OFF	2
+-#define ICH_RES_MEM_GCS	0
++#define ICH_RES_IO_TCO		0
++#define ICH_RES_IO_SMI		1
++#define ICH_RES_MEM_OFF		2
++#define ICH_RES_MEM_GCS_PMC	0
+ 
+ /* GPIO resources */
+ #define ICH_RES_GPIO	0
+ #define ICH_RES_GPE0	1
+ 
+ /* GPIO compatibility */
+-#define ICH_I3100_GPIO		0x401
+-#define ICH_V5_GPIO		0x501
+-#define ICH_V6_GPIO		0x601
+-#define ICH_V7_GPIO		0x701
+-#define ICH_V9_GPIO		0x801
+-#define ICH_V10CORP_GPIO	0xa01
+-#define ICH_V10CONS_GPIO	0xa11
++enum {
++	ICH_I3100_GPIO,
++	ICH_V5_GPIO,
++	ICH_V6_GPIO,
++	ICH_V7_GPIO,
++	ICH_V9_GPIO,
++	ICH_V10CORP_GPIO,
++	ICH_V10CONS_GPIO,
++	AVOTON_GPIO,
++};
+ 
+ struct lpc_ich_info {
+ 	char name[32];
+--- a/drivers/mfd/lpc_ich.c
++++ b/drivers/mfd/lpc_ich.c
+@@ -54,11 +54,11 @@
+  *	document number TBD : Avoton SoC
+  *	document number TBD : Coleto Creek
+  *	document number TBD : Wildcat Point-LP
++ *	document number TBD : 9 Series
+  */
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+-#include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/errno.h>
+@@ -72,9 +72,11 @@
+ #define ACPIBASE_GPE_END	0x2f
+ #define ACPIBASE_SMI_OFF	0x30
+ #define ACPIBASE_SMI_END	0x33
++#define ACPIBASE_PMC_OFF	0x08
++#define ACPIBASE_PMC_END	0x0c
+ #define ACPIBASE_TCO_OFF	0x60
+ #define ACPIBASE_TCO_END	0x7f
+-#define ACPICTRL		0x44
++#define ACPICTRL_PMCBASE	0x44
+ 
+ #define ACPIBASE_GCS_OFF	0x3410
+ #define ACPIBASE_GCS_END	0x3414
+@@ -90,16 +92,17 @@
+ #define wdt_mem_res(i) wdt_res(ICH_RES_MEM_OFF, i)
+ #define wdt_res(b, i) (&wdt_ich_res[(b) + (i)])
+ 
+-struct lpc_ich_cfg {
+-	int base;
+-	int ctrl;
+-	int save;
+-};
+-
+ struct lpc_ich_priv {
+ 	int chipset;
+-	struct lpc_ich_cfg acpi;
+-	struct lpc_ich_cfg gpio;
++
++	int abase;		/* ACPI base */
++	int actrl_pbase;	/* ACPI control or PMC base */
++	int gbase;		/* GPIO base */
++	int gctrl;		/* GPIO control */
++
++	int abase_save;		/* Cached ACPI base value */
++	int actrl_pbase_save;		/* Cached ACPI control or PMC base value */
++	int gctrl_save;		/* Cached GPIO control value */
+ };
+ 
+ static struct resource wdt_ich_res[] = {
+@@ -111,7 +114,7 @@
+ 	{
+ 		.flags = IORESOURCE_IO,
+ 	},
+-	/* GCS */
++	/* GCS or PMC */
+ 	{
+ 		.flags = IORESOURCE_MEM,
+ 	},
+@@ -211,8 +214,11 @@
+ 	LPC_LPT_LP,	/* Lynx Point-LP */
+ 	LPC_WBG,	/* Wellsburg */
+ 	LPC_AVN,	/* Avoton SoC */
++	LPC_BAYTRAIL,   /* Bay Trail SoC */
+ 	LPC_COLETO,	/* Coleto Creek */
+ 	LPC_WPT_LP,	/* Wildcat Point-LP */
++	LPC_BRASWELL,	/* Braswell SoC */
++	LPC_9S,		/* 9 Series */
+ };
+ 
+ static struct lpc_ich_info lpc_chipset_info[] = {
+@@ -303,6 +309,7 @@
+ 	[LPC_NM10] = {
+ 		.name = "NM10",
+ 		.iTCO_version = 2,
++		.gpio_version = ICH_V7_GPIO,
+ 	},
+ 	[LPC_ICH8] = {
+ 		.name = "ICH8 or ICH8R",
+@@ -484,6 +491,7 @@
+ 	[LPC_PPT] = {
+ 		.name = "Panther Point",
+ 		.iTCO_version = 2,
++		.gpio_version = ICH_V5_GPIO,
+ 	},
+ 	[LPC_LPT] = {
+ 		.name = "Lynx Point",
+@@ -499,7 +507,12 @@
+ 	},
+ 	[LPC_AVN] = {
+ 		.name = "Avoton SoC",
+-		.iTCO_version = 1,
++		.iTCO_version = 3,
++		.gpio_version = AVOTON_GPIO,
++	},
++	[LPC_BAYTRAIL] = {
++		.name = "Bay Trail SoC",
++		.iTCO_version = 3,
+ 	},
+ 	[LPC_COLETO] = {
+ 		.name = "Coleto Creek",
+@@ -509,6 +522,14 @@
+ 		.name = "Wildcat Point_LP",
+ 		.iTCO_version = 2,
+ 	},
++	[LPC_BRASWELL] = {
++		.name = "Braswell SoC",
++		.iTCO_version = 3,
++	},
++	[LPC_9S] = {
++		.name = "9 Series",
++		.iTCO_version = 2,
++	},
+ };
+ 
+ /*
+@@ -726,6 +747,7 @@
+ 	{ PCI_VDEVICE(INTEL, 0x1f39), LPC_AVN},
+ 	{ PCI_VDEVICE(INTEL, 0x1f3a), LPC_AVN},
+ 	{ PCI_VDEVICE(INTEL, 0x1f3b), LPC_AVN},
++	{ PCI_VDEVICE(INTEL, 0x0f1c), LPC_BAYTRAIL},
+ 	{ PCI_VDEVICE(INTEL, 0x2390), LPC_COLETO},
+ 	{ PCI_VDEVICE(INTEL, 0x9cc1), LPC_WPT_LP},
+ 	{ PCI_VDEVICE(INTEL, 0x9cc2), LPC_WPT_LP},
+@@ -734,6 +756,12 @@
+ 	{ PCI_VDEVICE(INTEL, 0x9cc6), LPC_WPT_LP},
+ 	{ PCI_VDEVICE(INTEL, 0x9cc7), LPC_WPT_LP},
+ 	{ PCI_VDEVICE(INTEL, 0x9cc9), LPC_WPT_LP},
++	{ PCI_VDEVICE(INTEL, 0x229c), LPC_BRASWELL},
++	{ PCI_VDEVICE(INTEL, 0x8cc1), LPC_9S},
++	{ PCI_VDEVICE(INTEL, 0x8cc2), LPC_9S},
++	{ PCI_VDEVICE(INTEL, 0x8cc3), LPC_9S},
++	{ PCI_VDEVICE(INTEL, 0x8cc4), LPC_9S},
++	{ PCI_VDEVICE(INTEL, 0x8cc6), LPC_9S},
+ 	{ 0, },			/* End of list */
+ };
+ MODULE_DEVICE_TABLE(pci, lpc_ich_ids);
+@@ -742,14 +770,20 @@
+ {
+ 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
+ 
+-	if (priv->acpi.save >= 0) {
+-		pci_write_config_byte(dev, priv->acpi.ctrl, priv->acpi.save);
+-		priv->acpi.save = -1;
++	if (priv->abase_save >= 0) {
++		pci_write_config_byte(dev, priv->abase, priv->abase_save);
++		priv->abase_save = -1;
++	}
++
++	if (priv->actrl_pbase_save >= 0) {
++		pci_write_config_byte(dev, priv->actrl_pbase,
++			priv->actrl_pbase_save);
++		priv->actrl_pbase_save = -1;
+ 	}
+ 
+-	if (priv->gpio.save >= 0) {
+-		pci_write_config_byte(dev, priv->gpio.ctrl, priv->gpio.save);
+-		priv->gpio.save = -1;
++	if (priv->gctrl_save >= 0) {
++		pci_write_config_byte(dev, priv->gctrl, priv->gctrl_save);
++		priv->gctrl_save = -1;
+ 	}
+ }
+ 
+@@ -758,9 +792,26 @@
+ 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
+ 	u8 reg_save;
+ 
+-	pci_read_config_byte(dev, priv->acpi.ctrl, &reg_save);
+-	pci_write_config_byte(dev, priv->acpi.ctrl, reg_save | 0x10);
+-	priv->acpi.save = reg_save;
++	switch (lpc_chipset_info[priv->chipset].iTCO_version) {
++	case 3:
++		/*
++		 * Some chipsets (eg Avoton) enable the ACPI space in the
++		 * ACPI BASE register.
++		 */
++		pci_read_config_byte(dev, priv->abase, &reg_save);
++		pci_write_config_byte(dev, priv->abase, reg_save | 0x2);
++		priv->abase_save = reg_save;
++		break;
++	default:
++		/*
++		 * Most chipsets enable the ACPI space in the ACPI control
++		 * register.
++		 */
++		pci_read_config_byte(dev, priv->actrl_pbase, &reg_save);
++		pci_write_config_byte(dev, priv->actrl_pbase, reg_save | 0x80);
++		priv->actrl_pbase_save = reg_save;
++		break;
++	}
+ }
+ 
+ static void lpc_ich_enable_gpio_space(struct pci_dev *dev)
+@@ -768,9 +819,20 @@
+ 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
+ 	u8 reg_save;
+ 
+-	pci_read_config_byte(dev, priv->gpio.ctrl, &reg_save);
+-	pci_write_config_byte(dev, priv->gpio.ctrl, reg_save | 0x10);
+-	priv->gpio.save = reg_save;
++	pci_read_config_byte(dev, priv->gctrl, &reg_save);
++	pci_write_config_byte(dev, priv->gctrl, reg_save | 0x10);
++	priv->gctrl_save = reg_save;
++}
++
++static void lpc_ich_enable_pmc_space(struct pci_dev *dev)
++{
++	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
++	u8 reg_save;
++
++	pci_read_config_byte(dev, priv->actrl_pbase, &reg_save);
++	pci_write_config_byte(dev, priv->actrl_pbase, reg_save | 0x2);
++
++	priv->actrl_pbase_save = reg_save;
+ }
+ 
+ static void lpc_ich_finalize_cell(struct pci_dev *dev, struct mfd_cell *cell)
+@@ -815,7 +877,7 @@
+ 	struct resource *res;
+ 
+ 	/* Setup power management base register */
+-	pci_read_config_dword(dev, priv->acpi.base, &base_addr_cfg);
++	pci_read_config_dword(dev, priv->abase, &base_addr_cfg);
+ 	base_addr = base_addr_cfg & 0x0000ff80;
+ 	if (!base_addr) {
+ 		dev_notice(&dev->dev, "I/O space for ACPI uninitialized\n");
+@@ -841,7 +903,7 @@
+ 
+ gpe0_done:
+ 	/* Setup GPIO base register */
+-	pci_read_config_dword(dev, priv->gpio.base, &base_addr_cfg);
++	pci_read_config_dword(dev, priv->gbase, &base_addr_cfg);
+ 	base_addr = base_addr_cfg & 0x0000ff80;
+ 	if (!base_addr) {
+ 		dev_notice(&dev->dev, "I/O space for GPIO uninitialized\n");
+@@ -891,7 +953,7 @@
+ 	struct resource *res;
+ 
+ 	/* Setup power management base register */
+-	pci_read_config_dword(dev, priv->acpi.base, &base_addr_cfg);
++	pci_read_config_dword(dev, priv->abase, &base_addr_cfg);
+ 	base_addr = base_addr_cfg & 0x0000ff80;
+ 	if (!base_addr) {
+ 		dev_notice(&dev->dev, "I/O space for ACPI uninitialized\n");
+@@ -910,14 +972,20 @@
+ 	lpc_ich_enable_acpi_space(dev);
+ 
+ 	/*
++	 * iTCO v2:
+ 	 * Get the Memory-Mapped GCS register. To get access to it
+ 	 * we have to read RCBA from PCI Config space 0xf0 and use
+ 	 * it as base. GCS = RCBA + ICH6_GCS(0x3410).
++	 *
++	 * iTCO v3:
++	 * Get the Power Management Configuration register.  To get access
++	 * to it we have to read the PMC BASE from config space and address
++	 * the register at offset 0x8.
+ 	 */
+ 	if (lpc_chipset_info[priv->chipset].iTCO_version == 1) {
+ 		/* Don't register iomem for TCO ver 1 */
+ 		lpc_ich_cells[LPC_WDT].num_resources--;
+-	} else {
++	} else if (lpc_chipset_info[priv->chipset].iTCO_version == 2) {
+ 		pci_read_config_dword(dev, RCBABASE, &base_addr_cfg);
+ 		base_addr = base_addr_cfg & 0xffffc000;
+ 		if (!(base_addr_cfg & 1)) {
+@@ -926,9 +994,17 @@
+ 			ret = -ENODEV;
+ 			goto wdt_done;
+ 		}
+-		res = wdt_mem_res(ICH_RES_MEM_GCS);
++		res = wdt_mem_res(ICH_RES_MEM_GCS_PMC);
+ 		res->start = base_addr + ACPIBASE_GCS_OFF;
+ 		res->end = base_addr + ACPIBASE_GCS_END;
++	} else if (lpc_chipset_info[priv->chipset].iTCO_version == 3) {
++		lpc_ich_enable_pmc_space(dev);
++		pci_read_config_dword(dev, ACPICTRL_PMCBASE, &base_addr_cfg);
++		base_addr = base_addr_cfg & 0xfffffe00;
++
++		res = wdt_mem_res(ICH_RES_MEM_GCS_PMC);
++		res->start = base_addr + ACPIBASE_PMC_OFF;
++		res->end = base_addr + ACPIBASE_PMC_END;
+ 	}
+ 
+ 	lpc_ich_finalize_cell(dev, &lpc_ich_cells[LPC_WDT]);
+@@ -952,28 +1028,35 @@
+ 		return -ENOMEM;
+ 
+ 	priv->chipset = id->driver_data;
+-	priv->acpi.save = -1;
+-	priv->acpi.base = ACPIBASE;
+-	priv->acpi.ctrl = ACPICTRL;
+ 
+-	priv->gpio.save = -1;
++	priv->actrl_pbase_save = -1;
++	priv->abase_save = -1;
++
++	priv->abase = ACPIBASE;
++	priv->actrl_pbase = ACPICTRL_PMCBASE;
++
++	priv->gctrl_save = -1;
+ 	if (priv->chipset <= LPC_ICH5) {
+-		priv->gpio.base = GPIOBASE_ICH0;
+-		priv->gpio.ctrl = GPIOCTRL_ICH0;
++		priv->gbase = GPIOBASE_ICH0;
++		priv->gctrl = GPIOCTRL_ICH0;
+ 	} else {
+-		priv->gpio.base = GPIOBASE_ICH6;
+-		priv->gpio.ctrl = GPIOCTRL_ICH6;
++		priv->gbase = GPIOBASE_ICH6;
++		priv->gctrl = GPIOCTRL_ICH6;
+ 	}
+ 
+ 	pci_set_drvdata(dev, priv);
+ 
+-	ret = lpc_ich_init_wdt(dev);
+-	if (!ret)
+-		cell_added = true;
++	if (lpc_chipset_info[priv->chipset].iTCO_version) {
++		ret = lpc_ich_init_wdt(dev);
++		if (!ret)
++			cell_added = true;
++	}
+ 
+-	ret = lpc_ich_init_gpio(dev);
+-	if (!ret)
+-		cell_added = true;
++	if (lpc_chipset_info[priv->chipset].gpio_version) {
++		ret = lpc_ich_init_gpio(dev);
++		if (!ret)
++			cell_added = true;
++	}
+ 
+ 	/*
+ 	 * We only care if at least one or none of the cells registered
+--- a/drivers/watchdog/iTCO_wdt.c
++++ b/drivers/watchdog/iTCO_wdt.c
+@@ -48,7 +48,7 @@
+ 
+ /* Module and version information */
+ #define DRV_NAME	"iTCO_wdt"
+-#define DRV_VERSION	"1.10"
++#define DRV_VERSION	"1.11"
+ 
+ /* Includes */
+ #include <linux/module.h>		/* For module specific items */
+@@ -92,9 +92,12 @@
+ 	unsigned int iTCO_version;
+ 	struct resource *tco_res;
+ 	struct resource *smi_res;
+-	struct resource *gcs_res;
+-	/* NO_REBOOT flag is Memory-Mapped GCS register bit 5 (TCO version 2)*/
+-	unsigned long __iomem *gcs;
++	/*
++	 * NO_REBOOT flag is Memory-Mapped GCS register bit 5 (TCO version 2),
++	 * or memory-mapped PMC register bit 4 (TCO version 3).
++	 */
++	struct resource *gcs_pmc_res;
++	unsigned long __iomem *gcs_pmc;
+ 	/* the lock for io operations */
+ 	spinlock_t io_lock;
+ 	struct platform_device *dev;
+@@ -125,11 +128,19 @@
+  * Some TCO specific functions
+  */
+ 
+-static inline unsigned int seconds_to_ticks(int seconds)
++/*
++ * The iTCO v1 and v2's internal timer is stored as ticks which decrement
++ * every 0.6 seconds.  v3's internal timer is stored as seconds (some
++ * datasheets incorrectly state 0.6 seconds).
++ */
++static inline unsigned int seconds_to_ticks(int secs)
+ {
+-	/* the internal timer is stored as ticks which decrement
+-	 * every 0.6 seconds */
+-	return (seconds * 10) / 6;
++	return iTCO_wdt_private.iTCO_version == 3 ? secs : (secs * 10) / 6;
++}
++
++static inline unsigned int ticks_to_seconds(int ticks)
++{
++	return iTCO_wdt_private.iTCO_version == 3 ? ticks : (ticks * 6) / 10;
+ }
+ 
+ static void iTCO_wdt_set_NO_REBOOT_bit(void)
+@@ -137,10 +148,14 @@
+ 	u32 val32;
+ 
+ 	/* Set the NO_REBOOT bit: this disables reboots */
+-	if (iTCO_wdt_private.iTCO_version == 2) {
+-		val32 = readl(iTCO_wdt_private.gcs);
++	if (iTCO_wdt_private.iTCO_version == 3) {
++		val32 = readl(iTCO_wdt_private.gcs_pmc);
++		val32 |= 0x00000010;
++		writel(val32, iTCO_wdt_private.gcs_pmc);
++	} else if (iTCO_wdt_private.iTCO_version == 2) {
++		val32 = readl(iTCO_wdt_private.gcs_pmc);
+ 		val32 |= 0x00000020;
+-		writel(val32, iTCO_wdt_private.gcs);
++		writel(val32, iTCO_wdt_private.gcs_pmc);
+ 	} else if (iTCO_wdt_private.iTCO_version == 1) {
+ 		pci_read_config_dword(iTCO_wdt_private.pdev, 0xd4, &val32);
+ 		val32 |= 0x00000002;
+@@ -154,12 +169,20 @@
+ 	u32 val32;
+ 
+ 	/* Unset the NO_REBOOT bit: this enables reboots */
+-	if (iTCO_wdt_private.iTCO_version == 2) {
+-		val32 = readl(iTCO_wdt_private.gcs);
++	if (iTCO_wdt_private.iTCO_version == 3) {
++		val32 = readl(iTCO_wdt_private.gcs_pmc);
++		val32 &= 0xffffffef;
++		writel(val32, iTCO_wdt_private.gcs_pmc);
++
++		val32 = readl(iTCO_wdt_private.gcs_pmc);
++		if (val32 & 0x00000010)
++			ret = -EIO;
++	} else if (iTCO_wdt_private.iTCO_version == 2) {
++		val32 = readl(iTCO_wdt_private.gcs_pmc);
+ 		val32 &= 0xffffffdf;
+-		writel(val32, iTCO_wdt_private.gcs);
++		writel(val32, iTCO_wdt_private.gcs_pmc);
+ 
+-		val32 = readl(iTCO_wdt_private.gcs);
++		val32 = readl(iTCO_wdt_private.gcs_pmc);
+ 		if (val32 & 0x00000020)
+ 			ret = -EIO;
+ 	} else if (iTCO_wdt_private.iTCO_version == 1) {
+@@ -192,7 +215,7 @@
+ 
+ 	/* Force the timer to its reload value by writing to the TCO_RLD
+ 	   register */
+-	if (iTCO_wdt_private.iTCO_version == 2)
++	if (iTCO_wdt_private.iTCO_version >= 2)
+ 		outw(0x01, TCO_RLD);
+ 	else if (iTCO_wdt_private.iTCO_version == 1)
+ 		outb(0x01, TCO_RLD);
+@@ -240,9 +263,9 @@
+ 	iTCO_vendor_pre_keepalive(iTCO_wdt_private.smi_res, wd_dev->timeout);
+ 
+ 	/* Reload the timer by writing to the TCO Timer Counter register */
+-	if (iTCO_wdt_private.iTCO_version == 2)
++	if (iTCO_wdt_private.iTCO_version >= 2) {
+ 		outw(0x01, TCO_RLD);
+-	else if (iTCO_wdt_private.iTCO_version == 1) {
++	} else if (iTCO_wdt_private.iTCO_version == 1) {
+ 		/* Reset the timeout status bit so that the timer
+ 		 * needs to count down twice again before rebooting */
+ 		outw(0x0008, TCO1_STS);	/* write 1 to clear bit */
+@@ -270,14 +293,14 @@
+ 	/* "Values of 0h-3h are ignored and should not be attempted" */
+ 	if (tmrval < 0x04)
+ 		return -EINVAL;
+-	if (((iTCO_wdt_private.iTCO_version == 2) && (tmrval > 0x3ff)) ||
++	if (((iTCO_wdt_private.iTCO_version >= 2) && (tmrval > 0x3ff)) ||
+ 	    ((iTCO_wdt_private.iTCO_version == 1) && (tmrval > 0x03f)))
+ 		return -EINVAL;
+ 
+ 	iTCO_vendor_pre_set_heartbeat(tmrval);
+ 
+ 	/* Write new heartbeat to watchdog */
+-	if (iTCO_wdt_private.iTCO_version == 2) {
++	if (iTCO_wdt_private.iTCO_version >= 2) {
+ 		spin_lock(&iTCO_wdt_private.io_lock);
+ 		val16 = inw(TCOv2_TMR);
+ 		val16 &= 0xfc00;
+@@ -312,13 +335,13 @@
+ 	unsigned int time_left = 0;
+ 
+ 	/* read the TCO Timer */
+-	if (iTCO_wdt_private.iTCO_version == 2) {
++	if (iTCO_wdt_private.iTCO_version >= 2) {
+ 		spin_lock(&iTCO_wdt_private.io_lock);
+ 		val16 = inw(TCO_RLD);
+ 		val16 &= 0x3ff;
+ 		spin_unlock(&iTCO_wdt_private.io_lock);
+ 
+-		time_left = (val16 * 6) / 10;
++		time_left = ticks_to_seconds(val16);
+ 	} else if (iTCO_wdt_private.iTCO_version == 1) {
+ 		spin_lock(&iTCO_wdt_private.io_lock);
+ 		val8 = inb(TCO_RLD);
+@@ -327,7 +350,7 @@
+ 			val8 += (inb(TCOv1_TMR) & 0x3f);
+ 		spin_unlock(&iTCO_wdt_private.io_lock);
+ 
+-		time_left = (val8 * 6) / 10;
++		time_left = ticks_to_seconds(val8);
+ 	}
+ 	return time_left;
+ }
+@@ -347,15 +370,15 @@
+ static const struct watchdog_ops iTCO_wdt_ops = {
+ 	.owner =		THIS_MODULE,
+ 	.start =		iTCO_wdt_start,
+-	.stop = 		iTCO_wdt_stop,
+-	.ping = 		iTCO_wdt_ping,
++	.stop =			iTCO_wdt_stop,
++	.ping =			iTCO_wdt_ping,
+ 	.set_timeout =		iTCO_wdt_set_timeout,
+ 	.get_timeleft =		iTCO_wdt_get_timeleft,
+ };
+ 
+ static struct watchdog_device iTCO_wdt_watchdog_dev = {
+ 	.info =		&ident,
+-	.ops = 		&iTCO_wdt_ops,
++	.ops =		&iTCO_wdt_ops,
+ };
+ 
+ /*
+@@ -376,16 +399,16 @@
+ 			resource_size(iTCO_wdt_private.tco_res));
+ 	release_region(iTCO_wdt_private.smi_res->start,
+ 			resource_size(iTCO_wdt_private.smi_res));
+-	if (iTCO_wdt_private.iTCO_version == 2) {
+-		iounmap(iTCO_wdt_private.gcs);
+-		release_mem_region(iTCO_wdt_private.gcs_res->start,
+-				resource_size(iTCO_wdt_private.gcs_res));
++	if (iTCO_wdt_private.iTCO_version >= 2) {
++		iounmap(iTCO_wdt_private.gcs_pmc);
++		release_mem_region(iTCO_wdt_private.gcs_pmc_res->start,
++				resource_size(iTCO_wdt_private.gcs_pmc_res));
+ 	}
+ 
+ 	iTCO_wdt_private.tco_res = NULL;
+ 	iTCO_wdt_private.smi_res = NULL;
+-	iTCO_wdt_private.gcs_res = NULL;
+-	iTCO_wdt_private.gcs = NULL;
++	iTCO_wdt_private.gcs_pmc_res = NULL;
++	iTCO_wdt_private.gcs_pmc = NULL;
+ }
+ 
+ static int iTCO_wdt_probe(struct platform_device *dev)
+@@ -414,27 +437,27 @@
+ 	iTCO_wdt_private.pdev = to_pci_dev(dev->dev.parent);
+ 
+ 	/*
+-	 * Get the Memory-Mapped GCS register, we need it for the
+-	 * NO_REBOOT flag (TCO v2).
++	 * Get the Memory-Mapped GCS or PMC register, we need it for the
++	 * NO_REBOOT flag (TCO v2 and v3).
+ 	 */
+-	if (iTCO_wdt_private.iTCO_version == 2) {
+-		iTCO_wdt_private.gcs_res = platform_get_resource(dev,
++	if (iTCO_wdt_private.iTCO_version >= 2) {
++		iTCO_wdt_private.gcs_pmc_res = platform_get_resource(dev,
+ 							IORESOURCE_MEM,
+-							ICH_RES_MEM_GCS);
++							ICH_RES_MEM_GCS_PMC);
+ 
+-		if (!iTCO_wdt_private.gcs_res)
++		if (!iTCO_wdt_private.gcs_pmc_res)
+ 			goto out;
+ 
+-		if (!request_mem_region(iTCO_wdt_private.gcs_res->start,
+-			resource_size(iTCO_wdt_private.gcs_res), dev->name)) {
++		if (!request_mem_region(iTCO_wdt_private.gcs_pmc_res->start,
++			resource_size(iTCO_wdt_private.gcs_pmc_res), dev->name)) {
+ 			ret = -EBUSY;
+ 			goto out;
+ 		}
+-		iTCO_wdt_private.gcs = ioremap(iTCO_wdt_private.gcs_res->start,
+-			resource_size(iTCO_wdt_private.gcs_res));
+-		if (!iTCO_wdt_private.gcs) {
++		iTCO_wdt_private.gcs_pmc = ioremap(iTCO_wdt_private.gcs_pmc_res->start,
++			resource_size(iTCO_wdt_private.gcs_pmc_res));
++		if (!iTCO_wdt_private.gcs_pmc) {
+ 			ret = -EIO;
+-			goto unreg_gcs;
++			goto unreg_gcs_pmc;
+ 		}
+ 	}
+ 
+@@ -442,7 +465,7 @@
+ 	if (iTCO_wdt_unset_NO_REBOOT_bit() && iTCO_vendor_check_noreboot_on()) {
+ 		pr_info("unable to reset NO_REBOOT flag, device disabled by hardware/BIOS\n");
+ 		ret = -ENODEV;	/* Cannot reset NO_REBOOT bit */
+-		goto unmap_gcs;
++		goto unmap_gcs_pmc;
+ 	}
+ 
+ 	/* Set the NO_REBOOT bit to prevent later reboots, just for sure */
+@@ -454,7 +477,7 @@
+ 		pr_err("I/O address 0x%04llx already in use, device disabled\n",
+ 		       (u64)SMI_EN);
+ 		ret = -EBUSY;
+-		goto unmap_gcs;
++		goto unmap_gcs_pmc;
+ 	}
+ 	if (turn_SMI_watchdog_clear_off >= iTCO_wdt_private.iTCO_version) {
+ 		/*
+@@ -478,14 +501,18 @@
+ 		ich_info->name, ich_info->iTCO_version, (u64)TCOBASE);
+ 
+ 	/* Clear out the (probably old) status */
+-	outw(0x0008, TCO1_STS);	/* Clear the Time Out Status bit */
+-	outw(0x0002, TCO2_STS);	/* Clear SECOND_TO_STS bit */
+-	outw(0x0004, TCO2_STS);	/* Clear BOOT_STS bit */
++	if (iTCO_wdt_private.iTCO_version == 3) {
++		outl(0x20008, TCO1_STS);
++	} else {
++		outw(0x0008, TCO1_STS);	/* Clear the Time Out Status bit */
++		outw(0x0002, TCO2_STS);	/* Clear SECOND_TO_STS bit */
++		outw(0x0004, TCO2_STS);	/* Clear BOOT_STS bit */
++	}
+ 
+ 	iTCO_wdt_watchdog_dev.bootstatus = 0;
+ 	iTCO_wdt_watchdog_dev.timeout = WATCHDOG_TIMEOUT;
+ 	watchdog_set_nowayout(&iTCO_wdt_watchdog_dev, nowayout);
+-	iTCO_wdt_watchdog_dev.parent = dev->dev.parent;
++	iTCO_wdt_watchdog_dev.parent = &dev->dev;
+ 
+ 	/* Make sure the watchdog is not running */
+ 	iTCO_wdt_stop(&iTCO_wdt_watchdog_dev);
+@@ -515,18 +542,18 @@
+ unreg_smi:
+ 	release_region(iTCO_wdt_private.smi_res->start,
+ 			resource_size(iTCO_wdt_private.smi_res));
+-unmap_gcs:
+-	if (iTCO_wdt_private.iTCO_version == 2)
+-		iounmap(iTCO_wdt_private.gcs);
+-unreg_gcs:
+-	if (iTCO_wdt_private.iTCO_version == 2)
+-		release_mem_region(iTCO_wdt_private.gcs_res->start,
+-				resource_size(iTCO_wdt_private.gcs_res));
++unmap_gcs_pmc:
++	if (iTCO_wdt_private.iTCO_version >= 2)
++		iounmap(iTCO_wdt_private.gcs_pmc);
++unreg_gcs_pmc:
++	if (iTCO_wdt_private.iTCO_version >= 2)
++		release_mem_region(iTCO_wdt_private.gcs_pmc_res->start,
++				resource_size(iTCO_wdt_private.gcs_pmc_res));
+ out:
+ 	iTCO_wdt_private.tco_res = NULL;
+ 	iTCO_wdt_private.smi_res = NULL;
+-	iTCO_wdt_private.gcs_res = NULL;
+-	iTCO_wdt_private.gcs = NULL;
++	iTCO_wdt_private.gcs_pmc_res = NULL;
++	iTCO_wdt_private.gcs_pmc = NULL;
+ 
+ 	return ret;
+ }

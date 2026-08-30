@@ -1,0 +1,40 @@
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@ -107,6 +107,7 @@
+ 	 * the MDIO bus at a time
+ 	 */
+ 	struct mutex mdio_lock;
++	u32 mdio_level;
+ 
+ 	struct device *parent;
+ 	enum {
+--- a/drivers/net/phy/mdio_bus.c
++++ b/drivers/net/phy/mdio_bus.c
+@@ -284,7 +284,7 @@
+ 
+ 	BUG_ON(in_interrupt());
+ 
+-	mutex_lock(&bus->mdio_lock);
++	mutex_lock_nested(&bus->mdio_lock, bus->mdio_level);
+ 	retval = bus->read(bus, addr, regnum);
+ 	mutex_unlock(&bus->mdio_lock);
+ 
+@@ -309,7 +309,7 @@
+ 
+ 	BUG_ON(in_interrupt());
+ 
+-	mutex_lock(&bus->mdio_lock);
++	mutex_lock_nested(&bus->mdio_lock, bus->mdio_level);
+ 	err = bus->write(bus, addr, regnum, val);
+ 	mutex_unlock(&bus->mdio_lock);
+ 
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@ -43,6 +43,7 @@
+ 	ds->slave_mii_bus->write = dsa_slave_phy_write;
+ 	snprintf(ds->slave_mii_bus->id, MII_BUS_ID_SIZE, "dsa-%d:%.2x",
+ 			ds->index, ds->pd->sw_addr);
++	ds->slave_mii_bus->mdio_level = ds->master_mii_bus->mdio_level + 1;
+ 	ds->slave_mii_bus->parent = &ds->master_mii_bus->dev;
+ }
+ 

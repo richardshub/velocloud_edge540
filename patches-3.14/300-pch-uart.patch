@@ -1,0 +1,38 @@
+--- a/drivers/tty/serial/pch_uart.c
++++ b/drivers/tty/serial/pch_uart.c
+@@ -229,6 +229,7 @@
+ 	struct pci_dev *pdev;
+ 	int fifo_size;
+ 	unsigned int uartclk;
++	unsigned int putc_timeout;
+ 	int start_tx;
+ 	int start_rx;
+ 	int tx_empty;
+@@ -1389,6 +1405,7 @@
+ 	termios->c_cflag &= ~CMSPAR; /* Mark/Space parity is not supported */
+ 
+ 	baud = uart_get_baud_rate(port, termios, old, 0, port->uartclk / 16);
++	priv->putc_timeout = port->uartclk / baud;
+ 
+ 	spin_lock_irqsave(&priv->lock, flags);
+ 	spin_lock(&port->lock);
+@@ -1508,9 +1525,9 @@
+  */
+ static void wait_for_xmitr(struct eg20t_port *up, int bits)
+ {
+-	unsigned int status, tmout = 10000;
++	unsigned int status, tmout = up->putc_timeout;
+ 
+-	/* Wait up to 10ms for the character(s) to be sent. */
++	/* Wait for the character(s) to be sent. */
+ 	for (;;) {
+ 		status = ioread8(up->membase + UART_LSR);
+ 
+@@ -1705,6 +1722,7 @@
+ 
+ 	priv->fifo_size = fifosize;
+ 	priv->uartclk = pch_uart_get_uartclk();
++	priv->putc_timeout = 10000;
+ 	priv->port_type = PORT_MAX_8250 + port_type + 1;
+ 	priv->port.dev = &pdev->dev;
+ 	priv->port.iobase = iobase;

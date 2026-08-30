@@ -1,0 +1,123 @@
+--- a/include/scsi/scsi.h
++++ a/include/scsi/scsi.h
+@@ -191,6 +191,10 @@
+ #define	ATA_16		      0x85	/* 16-byte pass-thru */
+ #define	ATA_12		      0xa1	/* 12-byte pass-thru */
+ 
++/* special ssd */
++#define SSD_IDLEIMM		0xf8	// ata idle immediate;
++#define SSD_SLEEP		0xf9	// ata sleep;
++
+ /*
+  *	SCSI command lengths
+  */
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -1486,6 +1486,38 @@
+ 	return 0;
+ }
+ 
++static int sd_ssd_special(struct scsi_disk *sdkp, unsigned char cmdb)
++{
++	int res;
++	struct scsi_device *sdp = sdkp->device;
++	const int timeout = sdp->request_queue->rq_timeout
++		* SD_FLUSH_TIMEOUT_MULTIPLIER;
++	struct scsi_sense_hdr sshdr;
++	unsigned char cmd[10] = { 0 };
++
++	if (!scsi_device_online(sdp))
++		return -ENODEV;
++
++	cmd[0] = cmdb;
++	res = scsi_execute_req_flags(sdp, cmd, DMA_NONE, NULL, 0,
++				     &sshdr, timeout, SD_MAX_RETRIES,
++				     NULL, REQ_PM);
++	if(res) {
++		sd_print_result(sdkp, res);
++		if (driver_byte(res) & DRIVER_SENSE)
++			sd_print_sense_hdr(sdkp, &sshdr);
++
++		/* we need to evaluate the error return  */
++		if (scsi_sense_valid(&sshdr) &&
++			(sshdr.asc == 0x3a ||	/* medium not present */
++			 sshdr.asc == 0x20))	/* invalid command */
++				/* this is no error here */
++				return 0;
++		return -EIO;
++	}
++	return 0;
++}
++
+ static void sd_rescan(struct device *dev)
+ {
+ 	struct scsi_disk *sdkp = scsi_disk_get_from_dev(dev);
+@@ -3120,6 +3152,14 @@
+ 		sd_start_stop_device(sdkp, 0);
+ 	}
+ 
++	// some SSDs need special idle to stop background writes;
++
++	if (sdkp->WCE && sdkp->media_present) {
++		sd_printk(KERN_NOTICE, sdkp, "SSD special\n");
++		sd_ssd_special(sdkp, SSD_IDLEIMM);
++		sd_ssd_special(sdkp, SSD_SLEEP);
++	}
++
+ exit:
+ 	scsi_disk_put(sdkp);
+ }
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -1396,6 +1396,38 @@
+ 	return 1;
+ }
+ 
++// translate ssd special;
++// some ssd need IDLE-IMMEDIATE followed by STANDBY to stop
++// background wear-leveling writes;
++
++static unsigned int ata_scsi_ssd_idleimm_xlat(struct ata_queued_cmd *qc)
++{
++	struct ata_taskfile *tf = &qc->tf;
++
++	tf->flags |= ATA_TFLAG_DEVICE;
++	tf->protocol = ATA_PROT_NODATA;
++	tf->command = ATA_CMD_IDLEIMMEDIATE;
++
++	/* critical for IO integrity, consider it an IO command */
++	qc->flags |= ATA_QCFLAG_IO;
++
++	return 0;
++}
++
++static unsigned int ata_scsi_ssd_sleep_xlat(struct ata_queued_cmd *qc)
++{
++	struct ata_taskfile *tf = &qc->tf;
++
++	tf->flags |= ATA_TFLAG_DEVICE;
++	tf->protocol = ATA_PROT_NODATA;
++	tf->command = ATA_CMD_SLEEP;
++
++	/* critical for IO integrity, consider it an IO command */
++	qc->flags |= ATA_QCFLAG_IO;
++
++	return 0;
++}
++
+ 
+ /**
+  *	ata_scsi_flush_xlat - Translate SCSI SYNCHRONIZE CACHE command
+@@ -3373,6 +3405,12 @@
+ 
+ 	case START_STOP:
+ 		return ata_scsi_start_stop_xlat;
++
++	case SSD_IDLEIMM:
++		return ata_scsi_ssd_idleimm_xlat;
++
++	case SSD_SLEEP:
++		return ata_scsi_ssd_sleep_xlat;
+ 	}
+ 
+ 	return NULL;

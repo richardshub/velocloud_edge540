@@ -1,0 +1,58 @@
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -7155,13 +7155,27 @@
+  * @ifreq:
+  * @cmd:
+  **/
++static s32 (*igb_phy_write_saved)(struct e1000_hw *, u32, u16);
++
++static s32
++igb_write_phy_reg_error(struct e1000_hw *hw, u32 reg, u16 val)
++{
++	return(-E1000_ERR_PHY);
++}
++
+ static int igb_mii_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
+ {
+ 	struct igb_adapter *adapter = netdev_priv(netdev);
+ 	struct mii_ioctl_data *data = if_mii(ifr);
++	int rv;
+ 
+-	if (adapter->hw.phy.media_type != e1000_media_type_copper)
++	switch(adapter->hw.phy.media_type) {
++	case e1000_media_type_copper:
++	case e1000_media_type_switch:
++		break;
++	default:
+ 		return -EOPNOTSUPP;
++	}
+ 
+ 	switch (cmd) {
+ 	case SIOCGMIIPHY:
+@@ -7173,6 +7187,26 @@
+ 			return -EIO;
+ 		break;
+ 	case SIOCSMIIREG:
++		// only for ethernet testing;
++		// must block other PHY writes once test mode is set;
++
++		rv = 0;
++		if((data->val_out == 2) && igb_phy_write_saved) {
++			adapter->hw.phy.ops.write_reg = igb_phy_write_saved;
++			igb_phy_write_saved = NULL;
++			rv = data->val_out;
++		}
++			
++		if (igb_write_phy_reg(&adapter->hw, data->reg_num & 0x1F,
++		                     data->val_in))
++			return -EIO;
++
++		if((data->val_out == 1) && !igb_phy_write_saved) {
++			igb_phy_write_saved = adapter->hw.phy.ops.write_reg;
++			adapter->hw.phy.ops.write_reg = igb_write_phy_reg_error;
++			rv = data->val_out;
++		}
++		return(rv);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}

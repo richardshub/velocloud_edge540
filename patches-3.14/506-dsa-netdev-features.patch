@@ -1,0 +1,31 @@
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@ -345,7 +348,6 @@
+ 	if (slave_dev == NULL)
+ 		return slave_dev;
+ 
+-	slave_dev->features = master->vlan_features;
+ 	SET_ETHTOOL_OPS(slave_dev, &dsa_slave_ethtool_ops);
+ 	eth_hw_addr_inherit(slave_dev, master);
+ 	slave_dev->tx_queue_len = 0;
+@@ -371,7 +373,6 @@
+ 	}
+ 
+ 	SET_NETDEV_DEV(slave_dev, parent);
+-	slave_dev->vlan_features = master->vlan_features;
+ 
+ 	p = netdev_priv(slave_dev);
+ 	p->dev = slave_dev;
+@@ -387,6 +388,12 @@
+ 		return NULL;
+ 	}
+ 
++	// disable features turned on by default;
++
++	slave_dev->features &= ~NETIF_F_SOFT_FEATURES;
++	slave_dev->hw_features &= ~NETIF_F_SOFT_FEATURES;
++	slave_dev->wanted_features &= ~NETIF_F_SOFT_FEATURES;
++
+ 	netif_carrier_off(slave_dev);
+ 
+ 	if (p->phy != NULL) {

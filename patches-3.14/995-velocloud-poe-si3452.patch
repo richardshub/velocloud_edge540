@@ -1,0 +1,1514 @@
+diff -N -r -u a/drivers/i2c/busses/i2c-si3452.c b/drivers/i2c/busses/i2c-si3452.c
+--- a/drivers/i2c/busses/i2c-si3452.c	1969-12-31 16:00:00.000000000 -0800
++++ b/drivers/i2c/busses/i2c-si3452.c	2015-01-12 15:02:35.689377749 -0800
+@@ -0,0 +1,1482 @@
++/* i2c-si3452.c
++ * (c) Jordan Rhody (jordan@velocloud.net)
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/jiffies.h>
++#include <linux/i2c-gpio.h>
++#include <linux/i2c.h>
++#include <linux/gpio.h>
++#include <linux/err.h>
++#include <linux/mutex.h>
++#include <linux/sysfs.h>
++#include <linux/printk.h>
++#include <linux/delay.h>
++#include <linux/eventfd.h>
++#include <linux/file.h>
++
++#define EDGE500_GPIO_RANGELEY 0
++#define EDGE500_GPIO_SMB_CLK (EDGE500_GPIO_RANGELEY + 14)
++#define EDGE500_GPIO_SMB_DATA (EDGE500_GPIO_RANGELEY + 13)
++
++#define VC_POE_NAME "vc-poe"
++
++#define VC_POE_CHIPSET_MONITOR_MS	250 /* In ms resolution. */
++
++#define POE_PORTS_COUNT		4 /* Si3452 controls 4 ports per chipset. */
++#define VC_POE_NAME "vc-poe"
++
++#define POE_TOTAL_mA_AVAIL	700
++
++#define POE_PORTS_COUNT		4    /* Si3452 controls 4 ports per chipset. */
++
++#define POE_FW_REV_STRING	"0.2.81" /* Si3452 Rev1.3 9/11 firmware rev. */
++
++#define POE_FW_REV_MAJOR	0x61
++#define POE_FW_REV_MINOR	0x62
++#define POE_FW_REV_PATCH	0x63
++
++#define POE_INTERRUPT_REG       0x0
++#define POE_INTERRUPT_MASK_REG  0x1
++
++#define POE_INTERRUPT_MASK_ALL  0xff
++
++#define POE_INTERRUPT_PORT_1    0x1
++#define POE_INTERRUPT_PORT_2    0x2
++#define POE_INTERRUPT_PORT_3    0x4
++#define POE_INTERRUPT_PORT_4    0x8
++#define POE_INTERRUPT_VEE       0x20
++#define POE_INTERRUPT_OVERTEMP  0x40
++
++/*Si3452 port 1:4 events base register. */
++#define POE_PORT_EVENTS_BASE	0x02 
++
++#define POE_PORT_PWR_EN_CHG	0x1
++#define POE_PORT_PWR_GOOD_CHG	0x2
++#define POE_PORT_DISCONN_EV	0x4
++#define POE_PORT_DET_COMPL	0x8
++#define POE_PORT_RGOOD_CLS	0x10
++#define	POE_PORT_EVENTS_TCUT	0x20
++#define POE_PORT_EVENTS_TSTART	0x40
++
++/* Si3452 port 1:4 status base register. */ 
++#define POE_PORT_STATUS_BASE	0x06  
++
++/* Si3452 Detect Encoding. */
++#define POE_PORT_STATUS_DETECT_UNKNOWN	0x0
++#define POE_PORT_STATUS_DETECT_SHORT	0x1
++#define POE_PORT_STATUS_DETECT_RLOW	0x3
++#define POE_PORT_STAT_DET_GOOD	0x4
++#define POE_PORT_STATUS_DETECT_RHIGH	0x5
++#define POE_PORT_STATUS_DETECT_ROPEN	0x6
++#define POE_PORT_STATUS_DETECT_MASK	0x7
++
++#define POE_PORT_STATUS_MASK	0x7
++
++#define POE_PORT_STATUS_DETECT(a) ((a >> 0) & POE_PORT_STATUS_MASK)
++
++/* Si3452 Class Encoding. */
++#define POE_PORT_STATUS_CLASS_UNKNOWN	0x0
++#define POE_PORT_STATUS_CLASS_1		0x1
++#define POE_PORT_STATUS_CLASS_2		0x2
++#define POE_PORT_STATUS_CLASS_3		0x3
++#define POE_PORT_STATUS_CLASS_4		0x4
++#define POE_PORT_STATUS_CLASS_PROBES_NE	0x5
++#define POE_PORT_STATUS_CLASS_0		0x6
++#define POE_PORT_STATUS_CLASS_OVERLOAD	0x7
++
++#define POE_PORT_STATUS_MASK		0x7
++
++#define POE_PORT_STATUS_CLASS(a) ((a >> 3) & POE_PORT_STATUS_MASK)
++
++#define POE_PORT_STATUS_PWR_ENABLE	0x40
++#define POE_PORT_STATUS_PWR_GOOD	0x80
++
++#define POE_PORT_OVERLOAD_mA_CLASS_0	350
++#define POE_PORT_OVERLOAD_mA_CLASS_1	91
++#define POE_PORT_OVERLOAD_mA_CLASS_2	160
++#define POE_PORT_OVERLOAD_mA_CLASS_3	350
++#define POE_PORT_OVERLOAD_mA_CLASS_4	600
++
++/* Si3452 port 1:4 iCUT base register. */
++#define POE_PORT_ICUT_BASE      0x0E
++
++/* Si3452 port 1:4 config base register. */
++#define POE_PORT_CONFIG_BASE	0x0A 
++
++/* Si3452 Port Mode Encoding. */
++#define POE_PORT_CONFIG_SHUTDOWN	0x0
++#define POE_PORT_CONFIG_MANUAL		0x1
++#define POE_PORT_CONFIG_SEMIAUTO	0x2
++#define POE_PORT_CONFIG_AUTO		0x3
++#define POE_PORT_CONFIG_DCENABLE	0x4
++#define POE_PORT_CONFIG_POE_PLUS	0x8
++#define POE_PORT_CONFIG_PRIORITY	0x10
++
++#define POE_PORT_CONFIG_MASK		0x3
++
++#define POE_PORT_CONFIG(a) ((a >> 0) & POE_PORT_CONFIG_MASK)
++
++/* Si3452 port 1:4 iCUT base register. */
++#define POE_PORT_ICUT_BASE      0x0E
++
++#define POE_PORT_ICUT_CLASS_0		0x75	/* Icut Nominal 375 mA */
++#define POE_PORT_ICUT_CLASS_1		0x1e	/* Icut Nominal 97 mA */
++#define POE_PORT_ICUT_CLASS_2		0x35	/* Icut Nominal 170 mA */
++#define POE_PORT_ICUT_CLASS_3		0x75	/* Icut Nominal 375 mA */
++#define POE_PORT_ICUT_CLASS_4_NO_POE	0x75	/* Icut Nominal 375 mA */
++#define POE_PORT_ICUT_CLASS_4_POE_PLUS	0xc9	/* Icut Nominal 640 mA */
++
++#define POE_PORT_GLOBAL_CMD_REG		0x12
++
++/* Si3452 Command codes. */
++#define POE_PORT_CMD_PWR_ON			0x4
++#define POE_PORT_CMD_PWR_OFF			0x8
++#define POE_PORT_CMD_RESET_PORT			0xC
++#define POE_PORT_CMD_TGL_DET_BACKOFF_TIMING	0x10
++#define POE_PORT_CMD_RESET_CHIP			0x14
++#define POE_PORT_CMD_READ_PORT_VEE		0x18
++#define POE_PORT_CMD_READ_PORT_CURRENT		0x1C
++#define POE_PORT_CMD_SHUTDOWN_LOW_PRIO_PORTS	0x20
++
++enum vc_poe_i2c_idx {
++        VC_I2C_NONE = -1,
++        VC_I2C_0 = 0,
++        VC_I2C_1,
++        N_VC_I2C_DEVS,
++};
++
++enum vc_poe_i2c_ports_idx {
++        VC_I2C_PORT_NONE = -1,
++        VC_I2C_PORT1 = 0,
++        VC_I2C_PORT2,
++        VC_I2C_PORT3,
++        VC_I2C_PORT4,
++        N_VC_I2C_PORTS,
++};
++
++enum vc_poe_i2c_chipset_mode {
++        VC_I2C_CHIPSET_MANUAL_MODE = 0,
++        VC_I2C_CHIPSET_AUTO_MODE,
++};
++
++enum vc_poe_i2c_port_state {
++	PORT_STATE_PWR_RESET = 0,
++	PORT_STATE_CLASSIFY,
++	PORT_STATE_MONITOR,
++};
++
++
++struct i2c_poe_chipset; // Forward declaration
++
++struct poe_port {
++	int port_state;
++        int device_class;
++        int device_mA;
++	struct work_struct port_work;
++        struct workqueue_struct *port_wq;
++        struct timer_list       poe_port_monitor_timer;
++	struct mutex            port_lock;
++	int port_powered;
++	int port_power_good;
++};
++
++struct i2c_poe_chipset {
++        struct poe_port port_dev[POE_PORTS_COUNT];
++        struct timer_list       poe_chip_monitor_timer;
++	struct i2c_client *client;
++	char fw_rev[8];
++        int total_mA_avail;
++	int mode;
++        struct workqueue_struct *chip_wq;
++	struct work_struct chip_work;
++	struct eventfd_ctx *eventfd;
++};
++
++struct poe_softc {
++        struct i2c_poe_chipset *i2c_dev[N_VC_I2C_DEVS];
++};
++
++static struct poe_softc poe_dev;
++
++static struct i2c_gpio_platform_data vc_poe_i2c = {
++        .sda_pin                = EDGE500_GPIO_SMB_DATA,
++        .sda_is_open_drain      = 0,
++        .scl_pin                = EDGE500_GPIO_SMB_CLK,
++        .scl_is_open_drain      = 0,
++        .udelay                 = 5,            /* ~100 kHz */
++};
++
++static struct platform_device vc_poe_device = {
++        .name                   = "i2c-gpio",
++        .id                     = 1,
++        .dev.platform_data      = &vc_poe_i2c,
++};
++
++
++//static const unsigned short vc_poe_i2c_addr[] = { 0x20, 0x21, I2C_CLIENT_END }; /* 0x20, 0x21 */
++static const unsigned short vc_poe_i2c_addr[] = { 0x20, I2C_CLIENT_END }; /* 0x20, 0x21 */
++
++static int vc_poe_determine_class_code(__u8 class_code)
++{
++        int mA;
++        switch (class_code) {
++
++                case POE_PORT_STATUS_CLASS_0:
++                        pr_info("Class 0 POE device\n");
++                        mA = POE_PORT_OVERLOAD_mA_CLASS_0;
++                break;
++
++                case POE_PORT_STATUS_CLASS_1:
++                        pr_info("Class 1 POE device\n");
++                        mA = POE_PORT_OVERLOAD_mA_CLASS_1;
++                break;
++
++                case POE_PORT_STATUS_CLASS_2:
++                        pr_info("Class 2 POE device\n");
++                        mA = POE_PORT_OVERLOAD_mA_CLASS_2;
++                break;
++
++                case POE_PORT_STATUS_CLASS_3:
++                        pr_info("Class 3 POE device\n");
++                        mA = POE_PORT_OVERLOAD_mA_CLASS_3;
++                break;
++
++                case POE_PORT_STATUS_CLASS_4:
++                        pr_info("Class 4 POE device\n");
++                        mA = POE_PORT_OVERLOAD_mA_CLASS_4;
++                break;
++
++                case POE_PORT_STATUS_CLASS_UNKNOWN:
++                case POE_PORT_STATUS_CLASS_PROBES_NE:
++                case POE_PORT_STATUS_CLASS_OVERLOAD:
++                        mA = 0;
++                break;
++        };
++
++        return mA;
++}
++
++static int vc_poe_calculate_total_mA(struct i2c_poe_chipset *chipset, 
++					__u8 port_id, int val)
++{
++	int poe_class, class_code;
++
++	class_code = POE_PORT_STATUS_CLASS(val);
++
++	poe_class = vc_poe_determine_class_code(class_code);
++#if 0
++        pr_info("Total mA available: %d\n", chipset->total_mA_avail);
++        pr_info("poe class mA requirements: %d\n", poe_class);
++#endif
++	if ((chipset->total_mA_avail - poe_class) >= 0) {
++
++		chipset->total_mA_avail -= poe_class;
++
++		chipset->port_dev[port_id].device_class = class_code;
++
++		chipset->port_dev[port_id].device_mA = poe_class;
++
++                return (0);
++	} 
++	pr_info("Power requirements unavailable for class device "
++			"%d on port %d\n", class_code, port_id);
++
++	chipset->port_dev[port_id].port_state = PORT_STATE_PWR_RESET;
++
++	return (-EINVAL);
++}
++
++
++
++static int vc_poe_chip_mask_interrupts(struct i2c_poe_chipset *chipset)
++{
++        int mask = 	POE_PORT_PWR_EN_CHG   | 
++			POE_PORT_PWR_GOOD_CHG |
++			POE_PORT_DISCONN_EV   |
++			POE_PORT_DET_COMPL    |
++			POE_PORT_RGOOD_CLS    |
++			POE_PORT_EVENTS_TCUT  |
++			POE_PORT_EVENTS_TSTART;
++
++        return i2c_smbus_write_byte_data(chipset->client,
++                                POE_INTERRUPT_MASK_REG, mask);
++}
++
++
++static int vc_poe_port_reset(struct i2c_poe_chipset *chipset, __u8 port_id)
++{
++        int rc;
++
++        rc = i2c_smbus_write_byte_data(chipset->client, 
++				POE_PORT_GLOBAL_CMD_REG,
++                                POE_PORT_CMD_RESET_PORT | port_id );
++
++        /* Defined by Si3452 datasheet which defines time
++         * from chip reset to start of I2C traffic as 100ms.
++         */
++
++        msleep(100);
++
++        return (rc);
++}
++
++
++static int vc_poe_chip_reset(struct i2c_poe_chipset *chipset)
++{
++        int rc;
++
++        rc = i2c_smbus_write_byte_data(chipset->client,
++                                POE_PORT_GLOBAL_CMD_REG,
++                                POE_PORT_CMD_RESET_CHIP);
++
++	if (rc < 0) {
++		dev_err(&chipset->client->dev, "failed writing register\n");
++                return rc;
++        }
++
++        /* Defined by Si3452 datasheet which defines time
++         * from chip reset to start of I2C traffic as 100ms.
++         */
++        msleep(100);
++
++        rc = vc_poe_chip_mask_interrupts(chipset);
++
++        return (rc);
++}
++
++static int poe_get_port_mA(struct i2c_poe_chipset *chipset, 
++			int port_id, int *msb, int *lsb)
++{
++        int rc;
++
++        rc = i2c_smbus_write_byte_data(chipset->client,
++                        POE_PORT_GLOBAL_CMD_REG,
++                        POE_PORT_CMD_READ_PORT_CURRENT | port_id);
++
++        if (! rc) {
++                *msb = i2c_smbus_read_byte_data(chipset->client, 
++					  0x15 + (port_id * 2));
++
++                *lsb = i2c_smbus_read_byte_data(chipset->client, 
++					  0x16 + (port_id * 2));
++        }
++
++        return (rc);
++}
++
++
++static int poe_check_firmware_revision(struct i2c_poe_chipset *chipset)
++{
++        int major, minor, patch;
++
++        major = i2c_smbus_read_byte_data(chipset->client, POE_FW_REV_MAJOR);
++        if (major < 0) {
++                goto bail;
++        }
++
++        minor = i2c_smbus_read_byte_data(chipset->client, POE_FW_REV_MINOR);
++        if (minor < 0) {
++                goto bail;
++        }
++
++        patch = i2c_smbus_read_byte_data(chipset->client, POE_FW_REV_PATCH);
++        if (patch < 0) {
++                goto bail;
++        }
++
++        sprintf(chipset->fw_rev, "%d.%d.%d", major, minor, patch);
++
++        if (strcmp(chipset->fw_rev, POE_FW_REV_STRING) == 0) {
++                dev_info(&chipset->client->dev,
++			"Si3452 fw revision: %s\n", chipset->fw_rev);
++                return (0);
++        }
++
++        dev_info(&chipset->client->dev, 
++		"Expected Si3452 fw revision: %s\n", POE_FW_REV_STRING);
++
++        dev_info(&chipset->client->dev,
++		"Actual Si3452 fw revision: %s\n", chipset->fw_rev);
++bail:
++        return -EINVAL;
++}
++
++static int vc_poe_port_pwr_on(struct i2c_poe_chipset *chipset, __u8 port_id)
++{
++        int val;
++
++        /* write port for configure manual mode. */
++        if (chipset->port_dev[port_id].device_class ==
++                POE_PORT_STATUS_CLASS_1) {
++
++                val = 0x1e;
++
++        } else if (chipset->port_dev[port_id].device_class ==
++                POE_PORT_STATUS_CLASS_2) {
++
++                val = 0x35;
++
++        } else if (chipset->port_dev[port_id].device_class ==
++                POE_PORT_STATUS_CLASS_0 ||
++                   chipset->port_dev[port_id].device_class ==
++                POE_PORT_STATUS_CLASS_3) {
++
++                val = 0x75;
++
++        } else if (chipset->port_dev[port_id].device_class ==
++                POE_PORT_STATUS_CLASS_4) {
++
++                val = 0xc9;
++
++        } else {
++		return -EINVAL;
++        }
++
++        i2c_smbus_write_byte_data(chipset->client,
++                        POE_PORT_ICUT_BASE + port_id, val);
++
++        i2c_smbus_write_byte_data(chipset->client,
++                        POE_PORT_CONFIG_BASE + port_id,
++                        POE_PORT_CONFIG_POE_PLUS |
++                        POE_PORT_CONFIG_DCENABLE |
++                        POE_PORT_CONFIG_PRIORITY |
++                        POE_PORT_CONFIG_MANUAL);
++
++        i2c_smbus_write_byte_data(chipset->client, 
++			POE_PORT_GLOBAL_CMD_REG,
++                        POE_PORT_CMD_PWR_ON | port_id );
++
++        return (0);
++}
++
++static int vc_poe_port_pwr_off(struct i2c_poe_chipset *chipset, __u8 port_id)
++{
++	int rc; 
++
++	rc = i2c_smbus_write_byte_data(chipset->client,
++                                POE_PORT_GLOBAL_CMD_REG,
++                                POE_PORT_CMD_PWR_OFF | port_id );
++
++        pr_info("Port %d power off\n", port_id);
++
++        return (rc);
++}
++
++static int vc_poe_port_interrupt(struct i2c_poe_chipset *chipset, __u8 port_id)
++{
++        int i, val;
++        /* Verify port is configured for manual mode. */
++        val = i2c_smbus_read_byte_data(chipset->client, POE_INTERRUPT_REG);
++
++        /* Immediately return. We want to reset the chip
++         * and reset all ports back to discovery.
++	 */
++	if (((__u8)val & 0xff) == 0xff) {
++
++                pr_info("Chip or port %d"
++                        " reset detected\n", port_id);
++
++		chipset->mode = VC_I2C_CHIPSET_AUTO_MODE;
++		chipset->total_mA_avail = POE_TOTAL_mA_AVAIL;
++
++		for (i = 0; i < POE_PORTS_COUNT; i++) {
++
++			chipset->port_dev[i].port_state = PORT_STATE_PWR_RESET;
++
++			chipset->port_dev[i].port_power_good = 0;
++			chipset->port_dev[i].port_powered = 0;
++        	}
++	}
++
++        if (val & (1 << port_id))
++                return 1;
++
++        return 0;
++}
++
++static int vc_poe_configure_semiauto_mode(struct i2c_poe_chipset *chipset, 
++							__u8 port_id)
++{
++        int val, rc;
++
++        /* write port for configure manual mode and POE+. */
++        rc = i2c_smbus_write_byte_data(chipset->client,
++                (POE_PORT_CONFIG_BASE + port_id),
++                 POE_PORT_CONFIG_SEMIAUTO);
++
++        if (rc < 0) {
++                pr_info("Cannot configure port %d"
++                        " in semi-auto mode.", port_id);
++                return (-EINVAL);
++        }
++
++        /* Verify port is configured for manual mode. */
++        val = i2c_smbus_read_byte_data(chipset->client,
++                (POE_PORT_CONFIG_BASE + port_id));
++
++        if (POE_PORT_CONFIG(val) == POE_PORT_CONFIG_SEMIAUTO) {
++                pr_info("Port %d is configured "
++                        "for semi-auto mode\n", port_id);
++
++                return (0);
++        }
++
++        return (0);
++}
++
++
++/** 
++ * vc_poe_configure_semiauto_mode_from_pwr_on - Configures ports on the Si3452.
++ *
++ * This function is supposed to be called in the driver state machine for
++ * setting up ports correctly depending on previous/current hardware state.
++ */
++static int vc_poe_configure_semiauto_mode_from_pwr_on(
++	struct i2c_poe_chipset *chipset, __u8 port_id)
++{
++        int val, class_code;
++
++        val = i2c_smbus_read_byte_data(chipset->client,
++                (POE_PORT_CONFIG_BASE + port_id));
++
++        /* We expect the port to be shutdown after power is applied. */
++         if (POE_PORT_CONFIG(val) == POE_PORT_CONFIG_SHUTDOWN) {
++
++                pr_info("Port %d is currently configured "
++                                "in shutdown mode\n", port_id);
++
++                return vc_poe_configure_semiauto_mode(chipset, port_id);
++
++	/* If not, it may be in one of two modes that were set a priori. */
++        } else if (POE_PORT_CONFIG(val) == POE_PORT_CONFIG_SEMIAUTO ||
++                  POE_PORT_CONFIG(val) == POE_PORT_CONFIG_MANUAL) {
++
++		/* 
++		 * If manual mode, check for good power
++		 * (meaning device is connected) and transition to
++		 * next state. Otherwise, it's possible that while 
++		 * we were down, the device was disconnected.
++		 * An interrupt isn't reliable enough, so simply check
++		 * the power status on the port.
++		 */
++                if (POE_PORT_CONFIG(val) == POE_PORT_CONFIG_MANUAL) {
++
++                        pr_info("Port %d is already configured "
++                                        "for manual mode\n", port_id);
++
++                        val = i2c_smbus_read_byte_data(chipset->client,
++                                (POE_PORT_STATUS_BASE + port_id));
++
++			/* 
++			 * If power is good, detect the class device connected.
++			 */
++			if (val & POE_PORT_STATUS_PWR_GOOD) {
++                        	class_code = POE_PORT_STATUS_CLASS(val);
++
++                        	pr_info("Port %d has device class code %d\n",
++                                                       port_id, class_code);
++
++                        	chipset->port_dev[port_id].device_class = 
++								class_code;
++				
++				chipset->port_dev[port_id].port_power_good = 1;
++                        	return (1);
++			/* 
++			 * If no power good, reset back to semi-auto
++			 * mode waiting for device detect and classification.
++			 */
++			} else {
++                		return vc_poe_configure_semiauto_mode(chipset, 
++								     port_id);
++			}
++
++		/* If already in semi-auto mode, simply wait for a class device
++		 * event indicating detect and classification.
++		 */
++                } else if (POE_PORT_CONFIG(val) == POE_PORT_CONFIG_SEMIAUTO) {
++
++                        pr_info("Port %d is already configured "
++                                "for semi-auto mode\n", port_id);
++
++                        return (0);
++                }
++
++	/* This state is unexpected and something not configured by the driver
++	 * and is not part of the Si3452 datasheet for default power on values.
++	 * Be paranoid and reset the port which will force it into shutdown
++	 * mode and set to semi-auto mode.
++	 */
++        } else {
++                if (POE_PORT_CONFIG(val) == POE_PORT_CONFIG_AUTO) {
++
++                        pr_info("Port %d is configured "
++                                "or auto mode\n", port_id);
++                }
++
++                pr_info("Resetting port %d\n", port_id);
++
++                (void) vc_poe_port_reset(chipset, port_id);
++
++                return (-1);
++        }
++
++        return (-EINVAL);
++}
++
++static int vc_poe_detect_classify_cycle(struct i2c_poe_chipset *chipset, 
++							__u8 port_id)
++{
++        int val, class_code;
++
++#if 0	
++	/* Detect "this port's interrupt. */
++        if (vc_poe_port_interrupt(chipset, port_id) == 0) {
++                return (1);
++        }
++#endif
++		
++        val = i2c_smbus_read_byte_data(chipset->client,
++                (POE_PORT_EVENTS_BASE + port_id));
++
++        if (val & POE_PORT_RGOOD_CLS) {
++
++                /* Verify that by reading the port status
++                 * register.
++                 */
++                val = i2c_smbus_read_byte_data(chipset->client,
++                        (POE_PORT_STATUS_BASE + port_id));
++                		
++                if (POE_PORT_STATUS_DETECT(val) == POE_PORT_STAT_DET_GOOD) {
++
++                        val = i2c_smbus_read_byte_data(chipset->client,
++                                (POE_PORT_STATUS_BASE + port_id));
++
++                        class_code = POE_PORT_STATUS_CLASS(val);
++
++                        /* Verify it's a class we recognize. */
++                        if (class_code > POE_PORT_STATUS_CLASS_UNKNOWN &&
++                                class_code < POE_PORT_STATUS_CLASS_OVERLOAD) {
++					
++				if (chipset->mode == VC_I2C_CHIPSET_MANUAL_MODE) {
++						/* Place eventfd here. */
++						return (1);
++				}
++
++				if (! vc_poe_calculate_total_mA(chipset, port_id, val)) {
++					return vc_poe_port_pwr_on(chipset, port_id);
++				} 
++
++				return -EINVAL;	
++
++                        } else {
++                                chipset->port_dev[port_id].port_state = 
++						PORT_STATE_PWR_RESET;
++				return (1);
++                        }
++                }
++        } else if (val & POE_PORT_DISCONN_EV) {
++                pr_info("Device disconnected on port %d\n", port_id);
++                chipset->port_dev[port_id].port_state = PORT_STATE_PWR_RESET;
++                return (1);
++        }
++
++        return (-EINVAL);
++}
++
++static int vc_poe_port_monitor(struct i2c_poe_chipset *chipset, __u8 port_id)
++{
++        int val, rc = 0;
++        int msb, lsb;
++
++	//msleep(150);
++
++        if (! vc_poe_port_interrupt(chipset, port_id)) {
++			
++		if (! chipset->port_dev[port_id].port_power_good) {
++
++			if (chipset->port_dev[port_id].port_powered == 4) {
++
++				chipset->total_mA_avail += 
++					chipset->port_dev[port_id].device_mA;
++
++                		vc_poe_configure_semiauto_mode(chipset, port_id);
++
++				pr_info("Port %d resetting\n", port_id);
++				chipset->port_dev[port_id].port_power_good = 0;
++				chipset->port_dev[port_id].port_powered = 0;
++			
++				return (3);
++
++			} else 
++				chipset->port_dev[port_id].port_powered++;
++		}
++                return 0;
++        }
++
++        poe_get_port_mA(chipset, port_id, &msb, &lsb);
++
++        /* Detect a good classification cycle. */
++        val = i2c_smbus_read_byte_data(chipset->client,
++                (POE_PORT_EVENTS_BASE + port_id));
++
++        if (((__u8)val & 0xff) == 0xff) {
++
++                /* Immediately return. We want to reset the chip
++                 * and reset all ports back to discovery.
++                 */
++                pr_info("Chip or port %d"
++                        " reset detected\n", port_id);
++
++                (void) vc_poe_chip_reset(chipset);
++
++		chipset->port_dev[port_id].port_power_good = 0;
++		chipset->port_dev[port_id].port_powered = 0;
++
++                return (2);
++        }
++
++        if ((val & POE_PORT_EVENTS_TCUT) && (msb == 0 && lsb == 0)) {
++
++                pr_info("Port %d"
++                        " device TCUT detected\n", port_id);
++
++                chipset->total_mA_avail += chipset->port_dev[port_id].device_mA;
++
++                vc_poe_port_reset(chipset, port_id);
++                
++		vc_poe_configure_semiauto_mode(chipset, port_id);
++		
++		chipset->port_dev[port_id].port_power_good = 0;
++		chipset->port_dev[port_id].port_powered = 0;
++
++                return (3);
++        }
++
++        if ((val & POE_PORT_EVENTS_TSTART)) {
++                pr_info("Port %d device TSTART detected\n", port_id);
++        }
++
++        if ((val & POE_PORT_PWR_EN_CHG)) {
++                pr_info("Port %d"
++                        " device power enable detected\n", port_id);
++        }
++
++        if ((val & POE_PORT_PWR_GOOD_CHG)) {
++                pr_info("Port %d"
++                        " device power good detected\n", port_id);
++
++		chipset->port_dev[port_id].port_power_good = 1;
++        }
++
++        if ((val & POE_PORT_DISCONN_EV) && (msb == 0 && lsb == 0)) {
++
++                pr_info("Port %d class %d "
++                        "device disconnect detected\n", port_id,
++                         chipset->port_dev[port_id].device_class);
++
++                chipset->total_mA_avail += chipset->port_dev[port_id].device_mA;
++
++                vc_poe_configure_semiauto_mode(chipset, port_id);
++
++		chipset->port_dev[port_id].port_power_good = 0;
++		chipset->port_dev[port_id].port_powered = 0;
++
++                return (1);
++        }
++
++        return (rc);
++}
++
++
++static void vc_poe_timer_function(unsigned long arg)
++{
++	struct i2c_poe_chipset *chip = (struct i2c_poe_chipset *)arg;
++
++        queue_work(chip->chip_wq, &chip->chip_work);
++
++        mod_timer(&chip->poe_chip_monitor_timer, 
++		msecs_to_jiffies(VC_POE_CHIPSET_MONITOR_MS) + jiffies);
++}
++
++
++static void vc_poe_port_work_fn(struct work_struct *work)
++{
++	int i, rc;
++	struct poe_port *port;
++
++	struct i2c_poe_chipset *chipset = 
++                container_of(work, struct i2c_poe_chipset, chip_work);
++
++	for (i = 0; i < POE_PORTS_COUNT; i++) {
++
++		port = &chipset->port_dev[i];
++			
++		/* Decide on the state we should transition to
++		 * given the current port configuration.
++		 */
++		mutex_lock(&port->port_lock);
++
++		switch (port->port_state) {
++
++			case PORT_STATE_PWR_RESET:
++				rc = vc_poe_configure_semiauto_mode_from_pwr_on(
++							      chipset, i);
++				if (rc == 0) 
++					port->port_state = PORT_STATE_CLASSIFY;
++				else if (rc == 1)
++					port->port_state = PORT_STATE_MONITOR;
++			break;
++
++			case PORT_STATE_CLASSIFY:
++				rc = vc_poe_detect_classify_cycle(chipset, i);
++
++				if (rc == 0) 
++					port->port_state = PORT_STATE_MONITOR;
++			break;
++
++			case  PORT_STATE_MONITOR:
++				rc = vc_poe_port_monitor(chipset, i);
++				if (rc == 1) {
++					port->port_state = PORT_STATE_CLASSIFY;
++				} else if (rc == 2) {
++					chipset->total_mA_avail = POE_TOTAL_mA_AVAIL;
++
++					for (i = 0; i < POE_PORTS_COUNT; i++) {
++						chipset->port_dev[i].port_state = 
++								PORT_STATE_PWR_RESET;
++					}
++				} else if (rc == 3) {
++					port->port_state = PORT_STATE_PWR_RESET;
++                        	}
++			break;
++		}
++		mutex_unlock(&port->port_lock);
++	}
++}
++
++static ssize_t show_fw_rev(struct device *dev,
++                 struct device_attribute *attr, char *buf)
++{
++	struct i2c_poe_chipset *chipset;
++	struct i2c_client *client = to_i2c_client(dev);
++
++	chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++	
++	return sprintf(buf, "%s\n", chipset->fw_rev);
++}
++
++static DEVICE_ATTR(fw_rev, S_IRUGO, show_fw_rev, NULL);
++
++static ssize_t set_chip_reset(struct device *dev,
++             struct device_attribute *attr, const char *buf, size_t size)
++{
++	int i, err;
++	unsigned long val;
++	struct i2c_poe_chipset *chipset;
++
++	struct i2c_client *client = to_i2c_client(dev);
++
++	chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++
++	err = kstrtoul(buf, 10, &val);
++        if (err)
++                return err;
++        
++	if (val) {
++                err = vc_poe_chip_reset(chipset);
++
++		chipset->mode = VC_I2C_CHIPSET_AUTO_MODE;
++                chipset->total_mA_avail = POE_TOTAL_mA_AVAIL;
++
++                for (i = 0; i < POE_PORTS_COUNT; i++) {
++                        chipset->port_dev[i].port_state = PORT_STATE_PWR_RESET;
++			chipset->port_dev[i].port_power_good = 0;
++                	chipset->port_dev[i].port_powered = 0;
++                }
++        }
++
++        return err < 0 ? err : size;
++}
++
++static DEVICE_ATTR(chip_reset, S_IWUSR, NULL, set_chip_reset);
++
++static ssize_t show_total_mA(struct device *dev,
++                 struct device_attribute *attr, char *buf)
++{
++        struct i2c_poe_chipset *chipset;
++        struct i2c_client *client = to_i2c_client(dev);
++
++        chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++
++	return sprintf(buf, "mA available: %d\n", chipset->total_mA_avail);
++}
++
++static ssize_t set_total_mA(struct device *dev,
++             struct device_attribute *attr, const char *buf, size_t size)
++{
++        int err;
++        unsigned long val;
++        struct i2c_poe_chipset *chipset;
++
++        struct i2c_client *client = to_i2c_client(dev);
++
++        chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++
++        err = kstrtoul(buf, 10, &val);
++        if (err)
++                return err;
++	
++	chipset->total_mA_avail = val;
++
++	return size;
++}
++
++static DEVICE_ATTR(total_mA, S_IRUGO|S_IWUSR, show_total_mA, set_total_mA);
++
++static ssize_t show_chip_mode(struct device *dev,
++                 struct device_attribute *attr, char *buf)
++{
++        struct i2c_poe_chipset *chipset;
++        struct i2c_client *client = to_i2c_client(dev);
++
++        chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++
++        return sprintf(buf, "mode: %s\n", 
++		(chipset->mode == VC_I2C_CHIPSET_MANUAL_MODE) ? "manual" : "auto");
++}
++
++static ssize_t set_chip_mode(struct device *dev,
++             struct device_attribute *attr, const char *buf, size_t size)
++{
++        struct i2c_poe_chipset *chipset;
++
++        struct i2c_client *client = to_i2c_client(dev);
++
++        chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++	
++	if (strstr(buf, "auto")) {
++		chipset->mode = VC_I2C_CHIPSET_AUTO_MODE;
++	} else if (strstr(buf, "manual")) {
++		chipset->mode = VC_I2C_CHIPSET_MANUAL_MODE;
++	} else {
++		return -EINVAL;
++	}
++
++        return size;
++}
++
++static DEVICE_ATTR(chip_mode, S_IRUGO|S_IWUSR, show_chip_mode, set_chip_mode);
++
++
++static ssize_t set_event_notify(struct device *dev,
++             struct device_attribute *attr, const char *buf, size_t size)
++{
++	int rc;
++	unsigned int efd;
++	struct fd efile;
++        struct i2c_poe_chipset *chipset;
++
++        struct i2c_client *client = to_i2c_client(dev);
++
++        chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++
++	rc = kstrtouint(buf, 10, &efd);
++        if (rc)
++                return rc;
++
++	efile = fdget(efd);
++	if (!efile.file) {
++                return -EBADF;
++        }
++
++	chipset->eventfd = eventfd_ctx_fileget(efile.file);
++
++	fdput(efile);
++
++        return size;
++}
++
++static DEVICE_ATTR(chip_notify, S_IWUSR, NULL, set_event_notify);
++
++
++static ssize_t
++show_power(struct device *dev, char *buf, unsigned index)
++{
++        int ret, val;
++	struct i2c_client *client;
++        struct i2c_poe_chipset *chipset;
++
++	if(index >= N_VC_I2C_PORTS)
++                return(-EINVAL);
++
++        client = to_i2c_client(dev);
++
++        chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++
++	val = i2c_smbus_read_byte_data(chipset->client,
++                        (POE_PORT_STATUS_BASE + index));
++
++        ret = scnprintf(buf, PAGE_SIZE, "%s\n", 
++		((val & POE_PORT_STATUS_PWR_GOOD)? "on" : "off"));
++
++        return(ret);
++}
++
++// store led color;
++
++static int
++store_power(struct device *dev, const char *buf, size_t len, unsigned index)
++{
++        int val, ret;
++	struct i2c_client *client;
++        struct i2c_poe_chipset *chipset;
++
++        if(index >= N_VC_I2C_PORTS)
++                return(-EINVAL);
++
++        client = to_i2c_client(dev);
++
++        chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++
++	if (strstr(buf, "on")) {
++
++		val = i2c_smbus_read_byte_data(chipset->client,
++        		(POE_PORT_STATUS_BASE + index));
++		
++		mutex_lock(&chipset->port_dev[index].port_lock);
++
++		if (chipset->mode == VC_I2C_CHIPSET_MANUAL_MODE)
++			vc_poe_calculate_total_mA(chipset, index, val);
++
++		ret = vc_poe_port_pwr_on(chipset, index);
++		if (ret < 0) {
++			mutex_unlock(&chipset->port_dev[index].port_lock);
++                	dev_err(dev, "port %d no device connected\n", index);
++		}
++
++		chipset->port_dev[index].port_state = PORT_STATE_MONITOR;
++		
++		mutex_unlock(&chipset->port_dev[index].port_lock);
++	
++	} else if (strstr(buf, "off")) {
++	
++		ret = vc_poe_port_pwr_off(chipset, index);
++
++		mutex_lock(&chipset->port_dev[index].port_lock);
++
++		if (chipset->mode == VC_I2C_CHIPSET_MANUAL_MODE) {
++
++                	chipset->total_mA_avail += 
++				chipset->port_dev[index].device_mA;
++
++                        chipset->port_dev[index].port_state = PORT_STATE_PWR_RESET;
++                        chipset->port_dev[index].port_power_good = 0;
++                        chipset->port_dev[index].port_powered = 0;
++                }
++		
++		mutex_unlock(&chipset->port_dev[index].port_lock);
++
++	} else {
++                dev_err(dev, "vc-poe: bad value: %s\n", buf);
++		ret = -EINVAL;
++	}
++
++        if(ret < 0)
++                return(ret);
++
++        return(len);
++}
++                    
++
++#define SHOW_POWER(name,index) \
++static ssize_t show_power_##name(struct device *dev, \
++                struct device_attribute *attr, \
++                char *buf) \
++{ \
++        return(show_power(dev, buf, index)); \
++}
++
++SHOW_POWER(pwr_p1, VC_I2C_PORT1)
++SHOW_POWER(pwr_p2, VC_I2C_PORT2)
++SHOW_POWER(pwr_p3, VC_I2C_PORT3)
++SHOW_POWER(pwr_p4, VC_I2C_PORT4)
++
++#define STORE_POWER(name,index) \
++static ssize_t store_power_##name(struct device *dev, \
++                struct device_attribute *attr, \
++                const char *buf, size_t len) \
++{ \
++        return(store_power(dev, buf, len, index)); \
++}
++
++STORE_POWER(pwr_p1, VC_I2C_PORT1)
++STORE_POWER(pwr_p2, VC_I2C_PORT2)
++STORE_POWER(pwr_p3, VC_I2C_PORT3)
++STORE_POWER(pwr_p4, VC_I2C_PORT4)
++
++#define ATTR_POWER(name) \
++static DEVICE_ATTR(name, S_IRUGO | S_IWUSR, show_power_##name, store_power_##name);
++
++ATTR_POWER(pwr_p1);
++ATTR_POWER(pwr_p2);
++ATTR_POWER(pwr_p3);
++ATTR_POWER(pwr_p4);
++
++static ssize_t
++show_icut(struct device *dev, char *buf, unsigned index)
++{
++        int ret, val;
++        struct i2c_client *client;
++        struct i2c_poe_chipset *chipset;
++
++        if(index >= N_VC_I2C_PORTS)
++                return(-EINVAL);
++
++        client = to_i2c_client(dev);
++
++        chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++
++	val = i2c_smbus_read_byte_data(chipset->client,
++                        POE_PORT_ICUT_BASE + index);
++
++	return sprintf(buf, "iCUT: 0x%2X\n", val);
++
++        return(ret);
++}
++
++static int
++store_icut(struct device *dev, const char *buf, size_t len, unsigned index)
++{
++        int err, val;
++        struct i2c_client *client;
++        struct i2c_poe_chipset *chipset;
++
++        if(index >= N_VC_I2C_PORTS)
++                return(-EINVAL);
++
++        client = to_i2c_client(dev);
++
++        chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++
++	err = kstrtouint(buf, 0, &val);
++        if (err) {
++                dev_err(dev, "vc-poe: bad value: %s\n", buf);
++                return err;
++	}
++
++ 	i2c_smbus_write_byte_data(chipset->client,
++                POE_PORT_ICUT_BASE + index, val);
++
++        return(len);
++}
++
++#define SHOW_ICUT(name,index) \
++static ssize_t show_icut_##name(struct device *dev, \
++                struct device_attribute *attr, \
++                char *buf) \
++{ \
++        return(show_icut(dev, buf, index)); \
++}
++
++SHOW_ICUT(icut_p1, VC_I2C_PORT1)
++SHOW_ICUT(icut_p2, VC_I2C_PORT2)
++SHOW_ICUT(icut_p3, VC_I2C_PORT3)
++SHOW_ICUT(icut_p4, VC_I2C_PORT4)
++
++#define STORE_ICUT(name,index) \
++static ssize_t store_icut_##name(struct device *dev, \
++                struct device_attribute *attr, \
++                const char *buf, size_t len) \
++{ \
++        return(store_icut(dev, buf, len, index)); \
++}
++
++STORE_ICUT(icut_p1, VC_I2C_PORT1)
++STORE_ICUT(icut_p2, VC_I2C_PORT2)
++STORE_ICUT(icut_p3, VC_I2C_PORT3)
++STORE_ICUT(icut_p4, VC_I2C_PORT4)
++
++#define ATTR_ICUT(name) \
++static DEVICE_ATTR(name, S_IRUGO | S_IWUSR, show_icut_##name, store_icut_##name);
++
++ATTR_ICUT(icut_p1);
++ATTR_ICUT(icut_p2);
++ATTR_ICUT(icut_p3);
++ATTR_ICUT(icut_p4);
++
++static int 
++store_port_reset(struct device *dev, const char *buf, size_t len, unsigned index)
++{
++	int val, err;
++        struct i2c_poe_chipset *chipset;
++
++        struct i2c_client *client = to_i2c_client(dev);
++
++        if(index >= N_VC_I2C_PORTS)
++                return(-EINVAL);
++
++        chipset = (struct i2c_poe_chipset *)i2c_get_clientdata(client);
++
++	err = kstrtouint(buf, 0, &val);
++        if (err) {
++                dev_err(dev, "vc-poe: bad value: %s\n", buf);
++                return err;
++        }
++
++        if (val) {
++                vc_poe_port_reset(chipset, index);
++		mutex_lock(&chipset->port_dev[index].port_lock);
++                chipset->total_mA_avail += chipset->port_dev[index].device_mA;
++                chipset->port_dev[index].port_state = PORT_STATE_PWR_RESET;
++		chipset->port_dev[index].port_power_good = 0;
++                chipset->port_dev[index].port_powered = 0;
++		mutex_unlock(&chipset->port_dev[index].port_lock);
++        }
++	
++	return len;
++}
++
++#define STORE_PORT_RESET(name,index) \
++static ssize_t store_port_##name(struct device *dev, \
++                struct device_attribute *attr, \
++                const char *buf, size_t len) \
++{ \
++        return(store_port_reset(dev, buf, len, index)); \
++}
++
++STORE_PORT_RESET(reset_p1, VC_I2C_PORT1)
++STORE_PORT_RESET(reset_p2, VC_I2C_PORT2)
++STORE_PORT_RESET(reset_p3, VC_I2C_PORT3)
++STORE_PORT_RESET(reset_p4, VC_I2C_PORT4)
++
++#define ATTR_RESET(name) \
++static DEVICE_ATTR(name, S_IWUSR, NULL, store_port_##name);
++
++ATTR_RESET(reset_p1);
++ATTR_RESET(reset_p2);
++ATTR_RESET(reset_p3);
++ATTR_RESET(reset_p4);
++
++static struct attribute *vc_poe_port_attrs[] = {
++        &dev_attr_pwr_p1.attr,
++        &dev_attr_pwr_p2.attr,
++        &dev_attr_pwr_p3.attr,
++        &dev_attr_pwr_p4.attr,
++        &dev_attr_icut_p1.attr,
++        &dev_attr_icut_p2.attr,
++        &dev_attr_icut_p3.attr,
++        &dev_attr_icut_p4.attr,
++        &dev_attr_reset_p1.attr,
++        &dev_attr_reset_p2.attr,
++        &dev_attr_reset_p3.attr,
++        &dev_attr_reset_p4.attr,
++        NULL,
++};
++
++static struct attribute_group port_attr_group = {
++        .name = "port_attr",
++        .attrs = vc_poe_port_attrs,
++};
++
++static int
++vc_poe_i2c_probe(struct i2c_client *client, const struct i2c_device_id *id)
++{
++        int i, err, chip = 0;
++
++        // only probe for devices we'd expect;
++        for(i = VC_I2C_0; i < N_VC_I2C_DEVS; i++) {
++                if(vc_poe_i2c_addr[i] == I2C_CLIENT_END)
++                        return(-ENODEV);
++                if(client->addr == vc_poe_i2c_addr[i]) {
++			chip = i;
++                        break;
++		}
++        }
++
++	poe_dev.i2c_dev[chip] = 
++		kmalloc(sizeof(struct i2c_poe_chipset), GFP_KERNEL|__GFP_ZERO);
++        if (!poe_dev.i2c_dev[chip])
++                return -ENOMEM;
++
++	poe_dev.i2c_dev[chip]->client = client;
++
++	i2c_set_clientdata(client, (void *)poe_dev.i2c_dev[chip]);
++
++	if (poe_check_firmware_revision(poe_dev.i2c_dev[chip]) < 0) {
++		kfree(poe_dev.i2c_dev[chip]);
++		return (-EINVAL);
++	}
++
++	poe_dev.i2c_dev[chip]->chip_wq = alloc_workqueue("vc-poe-chip", 0, 0);
++	if (!poe_dev.i2c_dev[chip]->chip_wq)
++		return (-ENOMEM);
++	
++	INIT_WORK(&poe_dev.i2c_dev[chip]->chip_work, vc_poe_port_work_fn);
++
++	init_timer(&poe_dev.i2c_dev[chip]->poe_chip_monitor_timer);
++
++	poe_dev.i2c_dev[chip]->poe_chip_monitor_timer.function = 
++		vc_poe_timer_function;
++        poe_dev.i2c_dev[chip]->poe_chip_monitor_timer.data = 
++		(unsigned long)poe_dev.i2c_dev[chip];
++
++	poe_dev.i2c_dev[chip]->total_mA_avail = POE_TOTAL_mA_AVAIL;
++
++	poe_dev.i2c_dev[chip]->mode = VC_I2C_CHIPSET_AUTO_MODE;
++
++	/* Reset initial state to power on.  State machine will detect hardware
++	 * state and put in the correct state.
++	 */
++	for (i = 0; i < POE_PORTS_COUNT; i++) {
++		poe_dev.i2c_dev[chip]->port_dev[i].port_state = 
++					  PORT_STATE_PWR_RESET;
++
++		mutex_init(&poe_dev.i2c_dev[chip]->port_dev[i].port_lock);
++	}
++
++	device_create_file(&client->dev, &dev_attr_fw_rev);	
++	device_create_file(&client->dev, &dev_attr_chip_reset);	
++	device_create_file(&client->dev, &dev_attr_total_mA);
++	device_create_file(&client->dev, &dev_attr_chip_notify);
++	device_create_file(&client->dev, &dev_attr_chip_mode);
++
++	err = sysfs_create_group(&client->dev.kobj, &port_attr_group);
++        if(err < 0) {
++                dev_err(&client->dev, "couldn't register chipset %s\n",
++						port_attr_group.name);
++		return (err);
++        }
++
++	mod_timer(&poe_dev.i2c_dev[chip]->poe_chip_monitor_timer, 
++		msecs_to_jiffies(VC_POE_CHIPSET_MONITOR_MS) + jiffies);
++
++	return (0);
++}
++
++
++static int
++vc_poe_i2c_remove(struct i2c_client *client)
++{
++        int i, chip = 0;
++
++	for(i = VC_I2C_0; i < N_VC_I2C_DEVS; i++) {
++                if(vc_poe_i2c_addr[i] == I2C_CLIENT_END)
++                        return(-ENODEV);
++                if(client->addr == vc_poe_i2c_addr[i]) {
++                        chip = i;
++                        break;
++                }
++        }
++
++	device_remove_file(&client->dev, &dev_attr_fw_rev);
++	device_remove_file(&client->dev, &dev_attr_chip_reset);
++	device_remove_file(&client->dev, &dev_attr_total_mA);
++	device_remove_file(&client->dev, &dev_attr_chip_notify);
++	device_remove_file(&client->dev, &dev_attr_chip_mode);
++
++	sysfs_remove_group(&client->dev.kobj, &port_attr_group);
++
++	/* delete timer */
++	del_timer_sync(&poe_dev.i2c_dev[chip]->poe_chip_monitor_timer);
++
++	/* flush all queue instances. */
++	flush_workqueue(poe_dev.i2c_dev[chip]->chip_wq);
++
++       /* destroy work queue. */
++        destroy_workqueue(poe_dev.i2c_dev[chip]->chip_wq);
++
++	kfree(poe_dev.i2c_dev[chip]);
++
++	poe_dev.i2c_dev[chip] = 0;
++
++	return (0);
++}
++
++static int
++vc_poe_i2c_detect(struct i2c_client *client, struct i2c_board_info *info)
++{
++        struct i2c_adapter *adapter = client->adapter;
++	
++        if( !i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA
++                | I2C_FUNC_SMBUS_WORD_DATA | I2C_FUNC_SMBUS_WRITE_BYTE)) {
++                pr_err("vc-poe: adaptor does not smbus\n");
++                return(-ENODEV);
++        }
++
++	strlcpy(info->type, VC_POE_NAME, I2C_NAME_SIZE);
++
++	return (0);
++}
++
++static const struct i2c_device_id vc_poe_i2c_id[] = {
++        { VC_POE_NAME, 0 },
++        {},
++};
++
++MODULE_DEVICE_TABLE(i2c, vc_poe_i2c_id);
++
++static struct i2c_driver vc_poe_i2c_driver = {
++        .class = I2C_CLASS_HWMON | I2C_CLASS_SPD,
++        .driver = {
++                .name = VC_POE_NAME,
++		.owner  = THIS_MODULE,
++        },
++        .probe = vc_poe_i2c_probe,
++        .remove = vc_poe_i2c_remove,
++        .id_table = vc_poe_i2c_id,
++        .detect = vc_poe_i2c_detect,
++	.address_list = vc_poe_i2c_addr,
++};
++
++
++static int __init vc_poe_init(void)
++{
++	int rc;
++
++	rc = platform_device_register(&vc_poe_device);
++        if(rc < 0) {
++                pr_err("couldn't register i2c-gpio\n");
++		return rc;
++        }
++
++	rc = i2c_add_driver(&vc_poe_i2c_driver);
++	if(rc < 0) {
++		platform_device_unregister(&vc_poe_device);
++
++		pr_err("Couldn't add I2C VC POE driver\n");
++	}
++	return (rc);
++}
++
++static void __exit
++vc_poe_exit(void)
++{
++	i2c_del_driver(&vc_poe_i2c_driver);
++
++	platform_device_unregister(&vc_poe_device);
++}
++
++module_init(vc_poe_init);
++module_exit(vc_poe_exit);
++
++MODULE_AUTHOR("Jordan Rhody <jordan@velocloud.net>");
++MODULE_DESCRIPTION("Velocloud POE Driver");
++MODULE_LICENSE("GPL");
+diff -N -r -u a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
+--- a/drivers/i2c/busses/Kconfig	2014-08-26 05:12:26.000000000 -0700
++++ b/drivers/i2c/busses/Kconfig	2015-01-12 15:47:47.977419401 -0800
+@@ -966,4 +966,13 @@
+ 	  This support is also available as a module.  If so, the module
+ 	  will be called scx200_acb.
+ 
++config I2C_SI3452
++        tristate "Support for Si3452 Power over Ethernet (POE) chipset"
++        depends on I2C_GPIO
++	default n
++        help
++          This option enables support for Power Over Ethernet (POE)
++          Silicon Image Si3452 I2C chipset on Velocloud platforms.
++          Say Y to enable support for POE on Velocloud.
++
+ endmenu
+diff -N -r -u a/drivers/i2c/busses/Makefile b/drivers/i2c/busses/Makefile
+--- a/drivers/i2c/busses/Makefile	2014-08-26 05:12:26.000000000 -0700
++++ b/drivers/i2c/busses/Makefile	2015-01-12 15:47:57.177419543 -0800
+@@ -68,6 +68,7 @@
+ obj-$(CONFIG_I2C_SH_MOBILE)	+= i2c-sh_mobile.o
+ obj-$(CONFIG_I2C_SIMTEC)	+= i2c-simtec.o
+ obj-$(CONFIG_I2C_SIRF)		+= i2c-sirf.o
++obj-$(CONFIG_I2C_SI3452)	+= i2c-si3452.o
+ obj-$(CONFIG_I2C_ST)		+= i2c-st.o
+ obj-$(CONFIG_I2C_STU300)	+= i2c-stu300.o
+ obj-$(CONFIG_I2C_TEGRA)		+= i2c-tegra.o

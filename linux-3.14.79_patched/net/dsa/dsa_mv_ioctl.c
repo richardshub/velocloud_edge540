@@ -1,0 +1,1073 @@
+/*
+ * Jegadish D (jegadish@velocloud.net)
+ * Copyright (C) 2013, Velocloud Inc.
+ * 
+ * IOCTL interface to access Marvell DSA 88E6123-61-65 switch 
+ *	- Read/Write port/global registers of the switch
+ *	- Read/Load/Purge MAC addresses from the switch memory 
+ *	- Read/Load/Purge/Flush VTU entries from the switch memory 
+ */
+
+#include "dsa_mv_ioctl.h"
+#include "dsa_priv.h"
+
+
+/* 802.1X - ATU Operations */
+uint8_t eap_mcast_addr[] = {0x01, 0x80, 0xC2, 0x00, 0x00, 0x03};
+
+static int dsa_slave_mv_reg_read(struct mii_bus* bus, struct dsa_mv_reg* msg, uint8_t port);
+static int dsa_slave_mv_reg_write(struct mii_bus* bus, struct dsa_mv_reg* msg, uint8_t port);
+
+static int dsa_slave_mv_mac_read(struct mii_bus* bus, 
+		struct dsa_mv_atu_opdesc* in_msg);
+static int dsa_slave_mv_mac_write(struct mii_bus* bus, 
+		struct dsa_mv_atu_opdesc* in_msg, int32_t port_num);
+static int dsa_slave_mv_mac_purge(struct mii_bus* bus, 
+		struct dsa_mv_atu_opdesc* msg, int32_t port_num);
+static int dsa_slave_mv_mac_flush(struct mii_bus* bus, 
+		struct dsa_mv_atu_opdesc* msg, int32_t port_num);
+static int dsa_slave_mv_1x_setup(struct mii_bus* bus, 
+		struct dsa_mv_atu_opdesc* msg, int32_t port_num);
+static int32_t dsa_slave_mv_opwait(struct mii_bus* bus, uint16_t reg);
+static int dsa_slave_mv_mac_load(struct mii_bus* bus, uint8_t* in_mac_addr);
+static int dsa_slave_mv_mac_lcopy(struct mii_bus* bus, uint8_t* mac_addr);
+
+
+/* VLAN - VTU Operations */
+static int32_t dsa_slave_mv_vtu_read(struct mii_bus* bus, 
+		struct dsa_mv_vtu_opdesc* in_msg);
+static int32_t dsa_slave_mv_vtu_write(struct mii_bus* bus, 
+		struct dsa_mv_vtu_opdesc* in_msg);
+static int32_t dsa_slave_mv_vtu_purge(struct mii_bus* bus, 
+		struct dsa_mv_vtu_opdesc* in_msg);
+static int32_t dsa_slave_mv_vtu_flush(struct mii_bus* bus, 
+		struct dsa_mv_vtu_opdesc* in_msg);
+
+/* STU Operations */
+static int32_t dsa_slave_mv_stu_write(struct mii_bus* bus, uint8_t sid, 
+		uint16_t port_state);
+static int32_t dsa_slave_mv_stu_exist(struct mii_bus* bus, uint8_t sid);
+
+// bridge loop interface;
+static int32_t dsa_slave_mv_atu_info(struct dsa_switch *, struct ifreq *);
+static int32_t dsa_slave_mv_atu_get(struct mii_bus *, struct ifreq *);
+static int32_t dsa_slave_mv_atu_set(struct mii_bus *, struct ifreq *);
+
+
+int dsa_slave_mv_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+{
+	int rc = 0;
+        struct dsa_slave_priv *p = netdev_priv(dev);
+        struct dsa_switch* ds = p->parent;
+	uint8_t port_num = p->port;
+
+	switch (cmd) {
+		case SIOCGMVREG:
+			rc = dsa_slave_mv_reg_read(ds->master_mii_bus,
+				       (struct dsa_mv_reg*) &(ifr->ifr_ifru), port_num);
+			break;
+		case SIOCSMVREG: 
+			rc = dsa_slave_mv_reg_write(ds->master_mii_bus,
+				       (struct dsa_mv_reg*) &(ifr->ifr_ifru), port_num);
+			break;
+		case SIOCGMVMAC:
+			rc = dsa_slave_mv_mac_read(ds->master_mii_bus,
+					(struct dsa_mv_atu_opdesc*) &(ifr->ifr_ifru));
+			break;
+		case SIOCSMVMAC:
+			rc = dsa_slave_mv_mac_write(ds->master_mii_bus,
+					(struct dsa_mv_atu_opdesc*) &(ifr->ifr_ifru),
+				       	port_num);
+			break;
+		case SIOCDMVMAC:
+			rc = dsa_slave_mv_mac_purge(ds->master_mii_bus,
+					(struct dsa_mv_atu_opdesc*) &(ifr->ifr_ifru),
+				       	port_num);
+			break;
+		case SIOCFMVMAC:
+			rc = dsa_slave_mv_mac_flush(ds->master_mii_bus,
+					(struct dsa_mv_atu_opdesc*) &(ifr->ifr_ifru),
+				       	port_num);
+			break;
+		case SIOCSMV1XM:
+			rc = dsa_slave_mv_1x_setup(ds->master_mii_bus,
+					(struct dsa_mv_atu_opdesc*) &(ifr->ifr_ifru),
+				       	port_num);
+			break;
+		case SIOCGMVVTU:
+			rc = dsa_slave_mv_vtu_read(ds->master_mii_bus,
+					(struct dsa_mv_vtu_opdesc*) &(ifr->ifr_ifru));
+			break;
+		case SIOCSMVVTU:
+			rc = dsa_slave_mv_vtu_write(ds->master_mii_bus,
+					(struct dsa_mv_vtu_opdesc*) &(ifr->ifr_ifru));
+			break;
+		case SIOCDMVVTU:
+			rc = dsa_slave_mv_vtu_purge(ds->master_mii_bus,
+					(struct dsa_mv_vtu_opdesc*) &(ifr->ifr_ifru));
+			break;
+		case SIOCFMVVTU:
+			rc = dsa_slave_mv_vtu_flush(ds->master_mii_bus,
+					(struct dsa_mv_vtu_opdesc*) &(ifr->ifr_ifru));
+			break;
+		case SIOCATUINFO:
+			rc = dsa_slave_mv_atu_info(ds, ifr);
+			break;
+		case SIOCGETATU:
+			rc = dsa_slave_mv_atu_get(ds->master_mii_bus, ifr);
+			break;
+		case SIOCSETATU:
+			rc = dsa_slave_mv_atu_set(ds->master_mii_bus, ifr);
+			break;
+
+	}
+	return rc;
+}
+
+static int
+dsa_slave_mv_reg_addr(struct dsa_mv_reg *msg, uint32_t *regp, uint8_t port)
+{
+	int type = msg->reg_type;
+	int addr = -EINVAL;
+	uint32_t reg;
+
+	reg = msg->reg_num;
+
+	switch(type) {
+	case MV_REG_XPORT:
+		port = msg->reg_port;
+	case MV_REG_PORT:
+		addr = MV_REG_PORT_ADDR + port;
+		break;
+	case MV_REG_GLOBAL:
+		addr = MV_REG_GLOBAL_ADDR;
+		break;
+	case MV_REG_GLOBAL2:
+		addr = MV_REG_GLOBAL2_ADDR;
+		break;
+	case MV_REG_SERDES:
+		port = 0xf;
+	case MV_REG_PHY:
+		addr = port;
+		reg |= (msg->reg_port << 16);
+		break;
+	}
+	*regp = reg;
+	return(addr);
+}
+
+static int
+dsa_slave_mv_reg_read(struct mii_bus *bus, struct dsa_mv_reg *msg, uint8_t port_num)
+{
+	int addr, reg, ret;
+
+	addr = dsa_slave_mv_reg_addr(msg, &reg, port_num);
+	if(addr < 0)
+		return(addr);
+	ret = mdiobus_read(bus, addr, reg);
+	if(ret < 0)
+		return(ret);
+	msg->reg_value = ret;
+	return(0);
+}
+
+static int
+dsa_slave_mv_reg_write(struct mii_bus *bus, struct dsa_mv_reg *msg, uint8_t port_num)
+{
+	int addr, reg, ret;
+
+	addr = dsa_slave_mv_reg_addr(msg, &reg, port_num);
+	if(addr < 0)
+		return(addr);
+	ret = mdiobus_write(bus, addr, reg, msg->reg_value);
+	return(ret);
+}
+
+static int dsa_slave_mv_mac_read(struct mii_bus* bus, 
+		struct dsa_mv_atu_opdesc* in_msg)
+{
+	int rc = 0;
+	struct dsa_mv_atu_opdata* out_msg = (struct dsa_mv_atu_opdata*)in_msg;
+	//TODO : Get FID from input structure
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x1, 0);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	rc = dsa_slave_mv_mac_load(bus, in_msg->mac_addr);
+	if (rc < 0)
+		goto error_return;
+	printk(KERN_DEBUG "In MAC: %0X %0X %0X %0X %0X %0X\n",
+			in_msg->mac_addr[0], in_msg->mac_addr[1],
+			in_msg->mac_addr[2], in_msg->mac_addr[3],
+			in_msg->mac_addr[4], in_msg->mac_addr[5]);
+
+	//ATU Op = set ops and start operation
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 
+			MV_ATU_OPS_REG, (0xC << 12));
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	rc = dsa_slave_mv_opwait(bus, MV_ATU_OPS_REG); 
+	memset(out_msg, 0, sizeof(struct dsa_mv_atu_opdata));
+	out_msg->ops_reg = rc;
+
+	rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR,
+			MV_ATU_DATA_REG);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_read failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	if (rc == 0) {
+		printk(KERN_DEBUG "DSA Marvell ioctl Entry state = 0 DATA: %u\n", rc);
+		rc = -ENODATA;
+		goto error_return;
+	}
+
+	out_msg->data_reg = rc;
+	rc = dsa_slave_mv_mac_lcopy(bus, out_msg->mac_addr);
+	if (rc < 0)
+		goto error_return;
+	printk(KERN_DEBUG "Out MAC: %0X %0X %0X %0X %0X %0X\n",
+			out_msg->mac_addr[0], out_msg->mac_addr[1],
+			out_msg->mac_addr[2], out_msg->mac_addr[3],
+			out_msg->mac_addr[4], out_msg->mac_addr[5]);
+	rc = 0;
+error_return:
+	return rc;
+}
+
+static int dsa_slave_mv_mac_write(struct mii_bus* bus,
+		struct dsa_mv_atu_opdesc* in_msg, int32_t port_num)
+{
+	int rc = 0;
+	uint16_t data_reg = 0;
+	struct dsa_mv_atu_opdata* out_msg = (struct dsa_mv_atu_opdata*)in_msg;
+	//TODO : Get FID from input structure
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x1, 0);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	data_reg = (1 << (port_num + 4)) | in_msg->entry_state;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR,
+			MV_ATU_DATA_REG, data_reg);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	rc = dsa_slave_mv_mac_load(bus, in_msg->mac_addr);
+	if (rc < 0)
+		goto error_return;
+	printk(KERN_DEBUG "In MAC: %0X %0X %0X %0X %0X %0X\n",
+			in_msg->mac_addr[0], in_msg->mac_addr[1],
+			in_msg->mac_addr[2], in_msg->mac_addr[3],
+			in_msg->mac_addr[4], in_msg->mac_addr[5]);
+
+	//ATU Op = set ops and start operation
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 
+			MV_ATU_OPS_REG, (0xB << 12));
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	rc = dsa_slave_mv_opwait(bus, MV_ATU_OPS_REG); 
+	memset(out_msg, 0, sizeof(struct dsa_mv_atu_opdata));
+	out_msg->ops_reg = rc;
+
+	rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR,
+			MV_ATU_DATA_REG);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_read failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	if (rc == 0) {
+		printk(KERN_DEBUG "DSA Marvell ioctl Entry state = 0 DATA: %u\n", rc);
+		rc = -ENODATA;
+		goto error_return;
+	}
+
+	out_msg->data_reg = rc;
+	rc = dsa_slave_mv_mac_lcopy(bus, out_msg->mac_addr);
+	if (rc < 0)
+		goto error_return;
+	printk(KERN_DEBUG "Out MAC: %0X %0X %0X %0X %0X %0X\n",
+			out_msg->mac_addr[0], out_msg->mac_addr[1],
+			out_msg->mac_addr[2], out_msg->mac_addr[3],
+			out_msg->mac_addr[4], out_msg->mac_addr[5]);
+	rc = 0;
+error_return:
+	return rc;
+}
+
+
+static int dsa_slave_mv_mac_purge(struct mii_bus* bus,
+		struct dsa_mv_atu_opdesc* in_msg, int32_t port_num)
+{
+	int rc = 0;
+	struct dsa_mv_atu_opdata* out_msg = (struct dsa_mv_atu_opdata*)in_msg;
+	uint16_t data_reg = 0;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x1, 0);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	data_reg = (1 << (port_num + 4));
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR,
+			MV_ATU_DATA_REG, data_reg & 0xFFF0);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	rc = dsa_slave_mv_mac_load(bus, in_msg->mac_addr);
+	if (rc < 0)
+		goto error_return;
+	printk(KERN_DEBUG "In MAC: %0X %0X %0X %0X %0X %0X\n",
+			in_msg->mac_addr[0], in_msg->mac_addr[1],
+			in_msg->mac_addr[2], in_msg->mac_addr[3],
+			in_msg->mac_addr[4], in_msg->mac_addr[5]);
+
+	//ATU Op = set ops and start operation
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 
+			MV_ATU_OPS_REG, (0xB << 12));
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	rc = dsa_slave_mv_opwait(bus, MV_ATU_OPS_REG); 
+	memset(out_msg, 0, sizeof(struct dsa_mv_atu_opdata));
+	out_msg->ops_reg = rc;
+
+	rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR,
+			MV_ATU_DATA_REG);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_read failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	if (rc == 0) {
+		printk(KERN_DEBUG "DSA Marvell ioctl Entry state = 0 DATA: %u\n", rc);
+		rc = -ENODATA;
+		goto error_return;
+	}
+
+	out_msg->data_reg = rc;
+	rc = dsa_slave_mv_mac_lcopy(bus, out_msg->mac_addr);
+	if (rc < 0)
+		goto error_return;
+	printk(KERN_DEBUG "Out MAC: %0X %0X %0X %0X %0X %0X\n",
+			out_msg->mac_addr[0], out_msg->mac_addr[1],
+			out_msg->mac_addr[2], out_msg->mac_addr[3],
+			out_msg->mac_addr[4], out_msg->mac_addr[5]);
+	rc = 0;
+error_return:
+	return rc;
+}
+
+static int dsa_slave_mv_mac_flush(struct mii_bus* bus,
+		struct dsa_mv_atu_opdesc* in_msg, int32_t port_num)
+{
+	int rc = 0;
+	struct dsa_mv_atu_opdata* out_msg = (struct dsa_mv_atu_opdata*)in_msg;
+	uint16_t data_reg = 0;
+	uint16_t ops_reg = 0;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x1, 0);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	data_reg = (1 << (port_num + 4));
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR,
+			MV_ATU_DATA_REG, data_reg & 0xFFF0);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	rc = dsa_slave_mv_mac_load(bus, in_msg->mac_addr);
+	if (rc < 0)
+		goto error_return;
+	printk(KERN_DEBUG "In MAC: %0X %0X %0X %0X %0X %0X\n",
+			in_msg->mac_addr[0], in_msg->mac_addr[1],
+			in_msg->mac_addr[2], in_msg->mac_addr[3],
+			in_msg->mac_addr[4], in_msg->mac_addr[5]);
+
+	if (in_msg->flush_all_flag)
+		ops_reg = (0x000D << 12);
+	else
+		ops_reg = (0x000E << 12);
+	//ATU Op = set ops and start operation
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 
+			MV_ATU_OPS_REG, ops_reg);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	rc = dsa_slave_mv_opwait(bus, MV_ATU_OPS_REG); 
+	memset(out_msg, 0, sizeof(struct dsa_mv_atu_opdata));
+	out_msg->ops_reg = rc;
+
+	rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR,
+			MV_ATU_DATA_REG);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_read failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	if (rc == 0) {
+		printk(KERN_DEBUG "DSA Marvell ioctl Entry state = 0 DATA: %u\n", rc);
+		rc = -ENODATA;
+		goto error_return;
+	}
+
+	out_msg->data_reg = rc;
+	rc = dsa_slave_mv_mac_lcopy(bus, out_msg->mac_addr);
+	if (rc < 0)
+		goto error_return;
+	printk(KERN_DEBUG "Out MAC: %0X %0X %0X %0X %0X %0X\n",
+			out_msg->mac_addr[0], out_msg->mac_addr[1],
+			out_msg->mac_addr[2], out_msg->mac_addr[3],
+			out_msg->mac_addr[4], out_msg->mac_addr[5]);
+	rc = 0;
+error_return:
+	return rc;
+}
+
+static int dsa_slave_mv_1x_setup(struct mii_bus* bus, 
+		struct dsa_mv_atu_opdesc* in_msg, int32_t port_num)
+{
+	int rc = 0;
+	uint16_t reg_val = 0;
+	uint16_t addr = MV_REG_PORT_ADDR + port_num;
+
+	rc = mdiobus_read(bus, addr, MV_PORT_AV_REG);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_read failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	reg_val = rc | 0x3000;//Locked port = 1, Ignore wrong Data = 1
+	rc = mdiobus_write(bus, addr, MV_PORT_AV_REG, reg_val);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	rc = mdiobus_read(bus, addr, MV_PORT_CR_REG);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_read failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	reg_val = rc | 0x4000;//SA filtering = 1
+	rc = mdiobus_write(bus, addr, MV_PORT_CR_REG, reg_val);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	in_msg->flush_all_flag = 1;
+	rc = dsa_slave_mv_mac_flush(bus, in_msg, port_num);
+	if (rc < 0) {
+		printk(KERN_ERR "MAC flush failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	memcpy(in_msg->mac_addr, eap_mcast_addr, ETH_ALEN);
+	in_msg->entry_state = 0xE;
+	
+	rc = dsa_slave_mv_mac_write(bus, in_msg, port_num);
+	if (rc < 0) {
+		printk(KERN_ERR "MAC write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	rc = 0;
+error_return:
+	return rc;
+
+}
+
+static int32_t dsa_slave_mv_opwait(struct mii_bus* bus, uint16_t reg) 
+{
+	int32_t rc = 0;
+	uint16_t reg_val = 0;
+	do {
+		msleep(1);
+		rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR, reg);
+		if (rc < 0) {
+			printk(KERN_ERR "mdiobus_read failed: %s:%d\n", 
+					__FUNCTION__, __LINE__);
+			break;
+		}
+		reg_val = rc;
+	} while (reg_val & 0x8000);
+	return rc;
+}
+
+static int dsa_slave_mv_mac_load(struct mii_bus* bus, uint8_t* in_mac_addr)
+{
+	uint16_t* mac_addr = (uint16_t*)in_mac_addr;
+	int rc = 0;
+
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR,
+			MV_ATU_MAC_REG1, htons(*mac_addr));
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	mac_addr++;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 
+			MV_ATU_MAC_REG2, htons(*mac_addr));
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	mac_addr++;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 
+			MV_ATU_MAC_REG3, htons(*mac_addr));
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+error_return:
+	return rc;
+}
+
+
+static int dsa_slave_mv_mac_lcopy(struct mii_bus* bus, uint8_t* mac_addr)
+{
+	uint16_t* out_mac_addr = (uint16_t*)mac_addr;
+	int rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR,
+			MV_ATU_MAC_REG1);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_read failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	*out_mac_addr = rc;
+	*out_mac_addr = ntohs(*out_mac_addr);
+	rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR, 
+			MV_ATU_MAC_REG2);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_read failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	out_mac_addr++;
+	*out_mac_addr = rc;
+	*out_mac_addr = ntohs(*out_mac_addr);
+	rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR, 
+			MV_ATU_MAC_REG3);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_read failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	out_mac_addr++;
+	*out_mac_addr = rc;
+	*out_mac_addr = ntohs(*out_mac_addr);
+error_return:
+	return rc;
+}
+
+// VLAN VTU Registers
+// 0x02 : VTU FID :: RES(3)-VP(1)-FID(12)
+// 0x03 : VTU SID :: RES(10)-SID(6)
+// 0x05 : VTU OP  :: Busy(1)-Op(3)-RES(5)-MemV(1)-MisV(1)-RES(1)-SPID(4)
+// 0x06 : VTU VID :: RES(3)-ReadValid/Load/Purge(1)-VID(12)
+// 0x07 : VTU Dat :: P3Data(4)-RES(2)-P2Data(2)-RES(2)-P1Data(2)-RES(2)-P0Data(2)
+// 0x08 : VTU Dat :: REES(8)-RES(2)-P5Data(2)-RES(2)-P4Data(2)
+// 0x09 : VTU Dat :: VIDPrioOverride(1)-VIDPRI(3)-RES(12)
+
+
+static int32_t dsa_slave_mv_vtu_read(struct mii_bus* bus, 
+		struct dsa_mv_vtu_opdesc* in_msg)
+{
+	int32_t rc = 0;
+	uint16_t value = 0;
+	struct dsa_mv_vtu_opdata* out_msg = (struct dsa_mv_vtu_opdata*)in_msg;
+
+	//vid load
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x06, in_msg->vid);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//start operation (Operation -Read and Set start bit)
+	value = 0x8000 | 0x4000;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x05, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	rc = dsa_slave_mv_opwait(bus, 0x05); 
+	memset(out_msg, 0, sizeof(struct dsa_mv_vtu_opdata));
+	out_msg->ops_reg = rc;
+
+	//vid read
+	rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR, 0x06);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	out_msg->vid = rc & 0x0FFF;
+	out_msg->valid_flag = (rc >> 12);
+	if (out_msg->valid_flag == 0) {
+		printk(KERN_INFO "VTU read invalid: %s:%d\n", __FUNCTION__, __LINE__);
+		rc = -1;
+		goto error_return;
+	}
+
+	//egress flag read
+	rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR, 0x07);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	out_msg->egress_flag = (rc & 0x0003);
+	out_msg->egress_flag |= ((rc & 0x0030) >> 2);
+	out_msg->egress_flag |= ((rc & 0x0300) >> 4);
+	out_msg->egress_flag |= ((rc & 0x3000) >> 6);
+	rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR, 0x08);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	out_msg->egress_flag |= ((rc & 0x0003) << 8);
+	out_msg->egress_flag |= ((rc & 0x0030) << 6);
+	return 0;
+
+error_return:
+	return rc;
+}
+
+
+static int32_t dsa_slave_mv_vtu_write(struct mii_bus* bus, 
+		struct dsa_mv_vtu_opdesc* in_msg)
+{
+	int32_t rc = 0;
+	uint16_t value = 0;
+	struct dsa_mv_vtu_opdata* out_msg = (struct dsa_mv_vtu_opdata*)in_msg;
+
+	//fid load
+	value = in_msg->fid;
+	if (in_msg->pol_flag)
+		value |= 0x1000;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x02, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	// load sid to STU if it does not exist already
+	if (dsa_slave_mv_stu_exist(bus, 0) != 0) {
+		rc = dsa_slave_mv_stu_write(bus, 0, 0);
+		if (rc < 0) {
+			printk(KERN_ERR "mdiobus_write failed: %s:%d\n", 
+					__FUNCTION__, __LINE__);
+			goto error_return;
+		}
+	}
+
+	//sid load
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x03, in_msg->sid);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//vid load | Load oper
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x06, in_msg->vid | 0x1000);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//data load 1
+	value = in_msg->egress_flag & 0x0003;
+	value |= ((in_msg->egress_flag >> 2) & 0x0003) << 4;
+	value |= ((in_msg->egress_flag >> 4) & 0x0003) << 8;
+	value |= ((in_msg->egress_flag >> 6) & 0x0003) << 12;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x07, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//data load 2
+	value = ((in_msg->egress_flag >> 8) & 0x0003);
+	value |= ((in_msg->egress_flag >> 10) & 0x0003) << 4;
+	value |= ((in_msg->egress_flag >> 12) & 0x0003) << 8;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x08, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//priority load
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x09, (in_msg->priority << 12) & 0x7000);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//start operation (Operation -Load and Set start bit)
+	value = 0x8000 | 0x3000;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x05, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	rc = dsa_slave_mv_opwait(bus, 0x05); 
+	memset(out_msg, 0, sizeof(struct dsa_mv_vtu_opdata));
+	out_msg->ops_reg = rc;
+	rc = 0;
+
+error_return:
+	return rc;
+}
+
+static int32_t dsa_slave_mv_vtu_purge(struct mii_bus* bus, 
+		struct dsa_mv_vtu_opdesc* in_msg)
+{
+	int32_t rc = 0;
+	uint16_t value = 0;
+	struct dsa_mv_vtu_opdata* out_msg = (struct dsa_mv_vtu_opdata*)in_msg;
+
+	//fid load
+	value = in_msg->fid;
+	if (in_msg->pol_flag)
+		value |= 0x1000;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x02, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//sid load
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x03, in_msg->sid);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//vid load
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x06, in_msg->vid);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//start operation (Operation -Purge and Set start bit)
+	value = 0x8000 | 0x3000;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x05, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	rc = dsa_slave_mv_opwait(bus, 0x05); 
+	memset(out_msg, 0, sizeof(struct dsa_mv_vtu_opdata));
+	out_msg->ops_reg = rc;
+	rc = 0;
+
+error_return:
+	return rc;
+}
+
+
+static int32_t dsa_slave_mv_vtu_flush(struct mii_bus* bus, 
+		struct dsa_mv_vtu_opdesc* in_msg)
+{
+	int32_t rc = 0;
+	uint16_t value = 0;
+	struct dsa_mv_vtu_opdata* out_msg = (struct dsa_mv_vtu_opdata*)in_msg;
+
+	//start operation (Operation -Flush and Set start bit)
+	value = 0x8000 | 0x1000;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x05, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	rc = dsa_slave_mv_opwait(bus, 0x05); 
+	memset(out_msg, 0, sizeof(struct dsa_mv_vtu_opdata));
+	out_msg->ops_reg = rc;
+	rc = 0;
+
+error_return:
+	return rc;
+}
+
+
+static int32_t dsa_slave_mv_stu_write(struct mii_bus* bus, uint8_t sid, 
+		uint16_t port_state)
+{
+	int32_t rc = 0;
+	uint16_t value = 0;
+
+	//sid load
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x03, sid & 0x3F);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	// valid flag
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x06, 0x1000);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//data load 1
+	value = port_state & 0x0003;
+	value |= ((port_state >> 2) & 0x0003) << 4;
+	value |= ((port_state >> 4) & 0x0003) << 8;
+	value |= ((port_state >> 6) & 0x0003) << 12;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x07, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//data load 2
+	value = ((port_state >> 8) & 0x0003);
+	value |= ((port_state >> 10) & 0x0003) << 4;
+	value |= ((port_state >> 12) & 0x0003) << 8;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x08, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//start operation (Operation -Load and Set start bit)
+	value = 0x8000 | 0x5000;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x05, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	rc = dsa_slave_mv_opwait(bus, 0x05); 
+	rc = 0;
+
+error_return:
+	return rc;
+}
+
+
+static int32_t dsa_slave_mv_stu_exist(struct mii_bus* bus, uint8_t sid)
+{
+	int32_t rc = 0;
+	uint16_t value = 0;
+
+	//sid load
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x03, sid - 1);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	//start operation (Operation -getNext and Set start bit)
+	value = 0x8000 | 0x6000;
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x05, value);
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_write failed: %s:%d\n", __FUNCTION__, __LINE__);
+		goto error_return;
+	}
+
+	rc = dsa_slave_mv_opwait(bus, 0x05); 
+	rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR, 0x3); 
+	if (rc < 0) {
+		printk(KERN_ERR "mdiobus_read failed: %s:%d\n", 
+				__FUNCTION__, __LINE__);
+		goto error_return;
+	}
+	rc = ((rc & 0x3F) == sid) ? 0 : -1; 
+
+error_return:
+	return rc;
+}
+
+// MAC bcast address;
+
+static uint8_t dsa_mac_bcast[ETH_ALEN] = { 0xff,0xff,0xff,0xff,0xff,0xff };
+
+// wait for atu to complete;
+
+static int32_t
+dsa_atu_op(struct mii_bus* bus, uint16_t cmd)
+{
+	int32_t cnt, rc;
+
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, MV_ATU_OPS_REG, cmd);
+	if(rc < 0)
+		return(rc);
+
+	cnt = 100;
+	do {
+		rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR, MV_ATU_OPS_REG);
+		if(rc < 0)
+			break;
+		if( !--cnt)
+			return(-ETIMEDOUT);
+	} while(rc & 0x8000);
+	return(rc);
+}
+
+// get atu info;
+
+static int32_t
+dsa_slave_mv_atu_info(struct dsa_switch *ds, struct ifreq *ifr)
+{
+	struct dsa_mv_atuinfo out;
+
+	// return atu info;
+
+	out.nmacs = 8192;
+	out.fid = 4095;
+	out.age = 0xff * 15;
+
+	out.cpu = 0x10;
+	out.cross = ds->dsa_port_mask;
+	out.lan = ds->phys_port_mask;
+	out.ports = out.cpu | out.cross | out.lan;
+
+	if(copy_to_user(ifr->ifr_ifru.ifru_data, &out, sizeof(out)))
+		return(-EFAULT);
+
+	return(0);
+}
+
+// read entire atu for FID;
+
+static int32_t
+dsa_slave_mv_atu_get(struct mii_bus *bus, struct ifreq *ifr)
+{
+	int rc, nent;
+	struct dsa_mv_atuent *ent, this;
+	struct dsa_mv_atuop in;
+
+	// copy in the request args;
+
+	if(copy_from_user(&in, ifr->ifr_ifru.ifru_data, sizeof(in)))
+		return(-EFAULT);
+
+	// check some params;
+
+	if(in.fid >= 4096)
+		return(-EINVAL);
+	if(in.nent == 0)
+		return(0);
+
+	// set FID;
+
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x1, in.fid);
+	if(rc < 0)
+		goto out;
+
+	// set starting MAC address to all 1s;
+	// need to load initial MAC only once;
+
+	rc = dsa_slave_mv_mac_load(bus, dsa_mac_bcast);
+	if(rc < 0)
+		goto out;
+
+	// loop through ATU GETNEXT operations until:
+	// - reach end of atu table, mac is all 1s again;
+	// - filled up the buffer given by user space;
+
+	ent = in.ent;
+	for(nent = 0; nent < in.nent; nent++, ent++) {
+		rc = dsa_atu_op(bus, 0xc << 12);
+		if(rc < 0)
+			goto out;
+
+		rc = dsa_slave_mv_mac_lcopy(bus, this.mac);
+		if(rc < 0)
+			goto out;
+		if( !memcmp(this.mac, dsa_mac_bcast, sizeof(dsa_mac_bcast)))
+			break;
+
+		rc = mdiobus_read(bus, MV_REG_GLOBAL_ADDR, MV_ATU_DATA_REG);
+		if(rc < 0)
+			goto out;
+
+		this.portvec = (rc >> 4) & 0x7f;
+		this.state = ((rc >> 8) & 0x80) | (rc & 0xf);
+
+		// non-trunk address was blocked when portvec is all 0s;
+		// give previously blocked MAC to user as well;
+		// copy entry to user;
+
+		rc = -EFAULT;
+		if(copy_to_user(ent, &this, sizeof(this)))
+			goto out;
+	}
+	rc = nent;
+
+	// handle errors;
+out:
+	return(rc);
+}
+
+// set atu entry for FID;
+
+static int32_t
+dsa_slave_mv_atu_set(struct mii_bus *bus, struct ifreq *ifr)
+{
+	int rc;
+	unsigned state;
+	struct dsa_mv_atuset *set;
+
+	// ifr contains ioctl data;
+
+	set = (struct dsa_mv_atuset *)&ifr->ifr_ifru;
+	if(set->fid >= 4096)
+		return(-EINVAL);
+
+	// set fid;
+
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0x1, set->fid & 0xfff);
+	if(rc < 0)
+		goto out;
+
+	// set MAC address;
+
+	rc = dsa_slave_mv_mac_load(bus, set->ent.mac);
+	if(rc < 0)
+		goto out;
+
+	// set MAC state;
+
+	state = ((set->ent.portvec & 0xff) << 4) | (set->ent.state & 0xf);
+	rc = mdiobus_write(bus, MV_REG_GLOBAL_ADDR, 0xc, state);
+	if(rc < 0)
+		goto out;
+
+	// execute atu opertion;
+	// purge or set static entry;
+
+	rc = dsa_atu_op(bus, 0xb << 12);
+	if(rc < 0)
+		goto out;
+	rc = 0;
+
+	// handle errors;
+out:
+	return(rc);
+}
+

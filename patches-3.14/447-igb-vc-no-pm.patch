@@ -1,0 +1,93 @@
+diff -Naur a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+--- a/drivers/net/ethernet/intel/igb/igb_main.c	2016-04-22 12:54:12.543472082 -0700
++++ b/drivers/net/ethernet/intel/igb/igb_main.c	2016-04-22 12:55:29.007959587 -0700
+@@ -195,6 +195,8 @@
+ extern void igb_vc_dsa_unregister(void);
+ 
+ #ifdef CONFIG_PM
++#ifdef CONFIG_IGB_VC_PM
++
+ #ifdef CONFIG_PM_SLEEP
+ static int igb_suspend(struct device *);
+ #endif
+@@ -209,6 +211,8 @@
+ 	SET_RUNTIME_PM_OPS(igb_runtime_suspend, igb_runtime_resume,
+ 			igb_runtime_idle)
+ };
++
++#endif
+ #endif
+ static void igb_shutdown(struct pci_dev *);
+ static int igb_pci_sriov_configure(struct pci_dev *dev, int num_vfs);
+@@ -250,8 +254,10 @@
+ 	.probe    = igb_probe,
+ 	.remove   = igb_remove,
+ #ifdef CONFIG_PM
++#ifdef CONFIG_IGB_VC_PM
+ 	.driver.pm = &igb_pm_ops,
+ #endif
++#endif
+ 	.shutdown = igb_shutdown,
+ 	.sriov_configure = igb_pci_sriov_configure,
+ 	.err_handler = &igb_err_handler
+@@ -7412,8 +7418,10 @@
+ 	u32 ctrl, rctl, status;
+ 	u32 wufc = runtime ? E1000_WUFC_LNKC : adapter->wol;
+ #ifdef CONFIG_PM
++#ifdef CONFIG_IGB_VC_PM
+ 	int retval = 0;
+ #endif
++#endif
+ 
+ 	netif_device_detach(netdev);
+ 
+@@ -7423,10 +7431,12 @@
+ 	igb_clear_interrupt_scheme(adapter);
+ 
+ #ifdef CONFIG_PM
++#ifdef CONFIG_IGB_VC_PM
+ 	retval = pci_save_state(pdev);
+ 	if (retval)
+ 		return retval;
+ #endif
++#endif
+ 
+ 	status = rd32(E1000_STATUS);
+ 	if (status & E1000_STATUS_LU)
+@@ -7478,6 +7488,7 @@
+ }
+ 
+ #ifdef CONFIG_PM
++#ifdef CONFIG_IGB_VC_PM
+ #ifdef CONFIG_PM_SLEEP
+ static int igb_suspend(struct device *dev)
+ {
+@@ -7587,6 +7598,7 @@
+ 	return igb_resume(dev);
+ }
+ #endif /* CONFIG_PM_RUNTIME */
++#endif /* CONFIG_IGB_VC_PM */
+ #endif
+ 
+ static void igb_shutdown(struct pci_dev *pdev)
+diff -Naur a/drivers/net/ethernet/intel/Kconfig b/drivers/net/ethernet/intel/Kconfig
+--- a/drivers/net/ethernet/intel/Kconfig	2015-10-26 17:46:24.000000000 -0700
++++ b/drivers/net/ethernet/intel/Kconfig	2016-04-22 12:55:43.147310430 -0700
+@@ -120,6 +120,17 @@
+ 	  This data is available via the hwmon sysfs interface and exposes
+ 	  the onboard sensors.
+ 
++config IGB_VC_PM
++	bool "VeloCloud PM (pwr mgt) support for IGB"
++	default n
++	depends on IGB && (PM_SLEEP || PM_RUNTIME)
++	---help---
++	Say Y here if we want to enable power management support for the
++	IGB driver.  Note that this will call suspend/resume.  This is 
++	important because suspend will disable the device/function.  Resume
++	will reinitialize the device.  If you don't know if this feature
++	should be enabled, keep the default setting.
++
+ config IGB_DCA
+ 	bool "Direct Cache Access (DCA) Support"
+ 	default y
