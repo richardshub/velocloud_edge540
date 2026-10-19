@@ -167,9 +167,10 @@ dsa_switch_setup(struct dsa_switch_tree *dst, int index,
 	 * tagging protocol to the preferred tagging format of this
 	 * switch.
 	 */
-	if (ds->dst->cpu_switch == index)
+	if (ds->dst->cpu_switch == index){
+pr_info("tag_protocol: %i\n",drv->tag_protocol);
 		ds->dst->tag_protocol = drv->tag_protocol;
-
+	}
 	/*
 	 * Do basic register setup.
 	 */

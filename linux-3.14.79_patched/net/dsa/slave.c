@@ -47,8 +47,7 @@ void dsa_slave_mii_bus_init(struct dsa_switch *ds)
 	master = ds->master_mii_bus;
 	ds->slave_mii_bus->mdio_level = master->mdio_level + 1;
 	ds->slave_mii_bus->parent = &master->dev;
-	snprintf(ds->slave_mii_bus->id, MII_BUS_ID_SIZE, "dsa-%d.%d:%.2x",
-		ds->root, ds->index, ds->pd->sw_addr);
+	snprintf(ds->slave_mii_bus->id, MII_BUS_ID_SIZE, "dsa-%d.%d:%.2x",ds->root, ds->index, ds->pd->sw_addr);
 }
 
 
